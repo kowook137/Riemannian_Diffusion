@@ -66,6 +66,7 @@ class EmbodimentPoseGraphManifold(Manifold):
         sigma_p: float = 0.01,
         sigma_R: float = 0.1,
         metric: str = "riemannian",
+        tikhonov_frac: float = 0.0,
     ):
         if metric not in ("riemannian", "chart_euclidean"):
             raise ValueError(f"unknown metric mode '{metric}'")
@@ -77,6 +78,10 @@ class EmbodimentPoseGraphManifold(Manifold):
         self.W_p = float(sigma_p) ** -2
         self.W_R = float(sigma_R) ** -2
         self.metric = metric
+        # Fix 2 (noise_stationary_fix.md): adaptive Tikhonov on G_pose.
+        # 0.0 → fixed jitter only (legacy behavior).  Set > 0 (e.g. 1e-2) to
+        # add λ(q) = tikhonov_frac · tr(G)/n_q before Cholesky.
+        self.tikhonov_frac = float(tikhonov_frac)
 
     # ---------------- dim properties ----------------
     @property
@@ -152,20 +157,33 @@ class EmbodimentPoseGraphManifold(Manifold):
         eye = torch.eye(self.n_q, device=q.device, dtype=q.dtype)
         return eye + Jp.transpose(-1, -2) @ (W * Jp)
 
-    def G_pose_chol(self, q: Tensor, z: Tensor, jitter: float = 1e-4) -> Tensor:
-        """Cholesky of G_pose with adaptive jitter retry (numerical safety net).
+    def G_pose_chol(self, q: Tensor, z: Tensor, jitter: float = 1e-4,
+                    tikhonov_frac: float | None = None) -> Tensor:
+        """Cholesky of G_pose with optional adaptive Tikhonov + jitter retry.
 
-        Note (per `noise_stationary_fix.md` Layer B analysis):
-        - The fundamental cure for cond(G_pose) blow-up is **Fix 1**:
-          loosen σ_p (default 0.05 → W_p = 400, cond ~10²).  Additive
-          Tikhonov λ I on (I + J^T W J) cannot meaningfully reduce
-          cond when max eig is dominated by W_p · ‖J‖² ≫ 1.
-        - This jitter (1e-4) acts only as a final FP-precision safety
-          belt for off-distribution q during forward GRW; it does not
-          alter the metric's conditioning structurally.
+        Per `noise_stationary_fix.md` Fix 2: adaptive Tikhonov is a principled
+        upgrade of the ad-hoc fixed jitter 1e-4.  Replaces fixed `jitter` with
+            λ(q) = tikhonov_frac · tr(G(q)) / n_q
+        which scales with G's magnitude (so always proportional to G's
+        diagonal, regardless of σ_p choice).
+
+        - `tikhonov_frac = None`:  read from `self.tikhonov_frac` (default 0.0
+            → fixed jitter only, backward-compat).
+        - `tikhonov_frac > 0.0`:  adaptive Tikhonov + final jitter as safety belt.
+
+        Note: additive λI cannot fundamentally reduce cond(I + J^T W J) when
+        max eig is dominated by W_p · ‖J‖² ≫ 1 (that is Fix 1's role: loosen
+        σ_p).  Tikhonov primarily helps off-distribution q where G's
+        diagonal grows.
         """
+        if tikhonov_frac is None:
+            tikhonov_frac = self.tikhonov_frac
         G = self.G_pose(q, z)
         eye = torch.eye(self.n_q, device=q.device, dtype=q.dtype)
+        if tikhonov_frac > 0.0:
+            tr_G = torch.diagonal(G, dim1=-2, dim2=-1).sum(-1)               # (...,)
+            lam = (tikhonov_frac * tr_G / self.n_q).unsqueeze(-1).unsqueeze(-1)
+            G = G + lam * eye
         for j in (jitter, jitter * 10.0, jitter * 100.0):
             try:
                 return torch.linalg.cholesky(G + j * eye)
@@ -325,8 +343,10 @@ class Franka7DoFPose(EmbodimentPoseGraphManifold):
         sigma_R: float = 0.1,
         metric: str = "riemannian",
         joint_limit_margin_frac: float = 0.10,
+        tikhonov_frac: float = 0.0,
     ):
-        super().__init__(n_q=7, n_z=1, sigma_p=sigma_p, sigma_R=sigma_R, metric=metric)
+        super().__init__(n_q=7, n_z=1, sigma_p=sigma_p, sigma_R=sigma_R,
+                          metric=metric, tikhonov_frac=tikhonov_frac)
         import pytorch_kinematics as pk
         import logging
         _pk_log_level = logging.getLogger("pytorch_kinematics").level

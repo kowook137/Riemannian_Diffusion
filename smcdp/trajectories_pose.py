@@ -43,8 +43,26 @@ class PoseLangevinSDE:
     (μ_q, γ).  The chart-form pose forward and reverse GRW both use these
     via internal helpers (no separate limiting-distribution class).
 
-    extension.tex Eq. (16):  U^pose = (1/2γ²) ‖q−μ_q‖² + ½ log det G_pose
-    extension.tex Eq. (17):  b^q   = −½ G⁻¹ ∇_q U^pose
+    Two drift potential conventions are supported (selected by
+    ``confining_kappa``):
+
+    Legacy (default, ``confining_kappa = 0``):
+        U^pose(q)  =  (1/2γ²) ‖q − μ_q‖²  +  ½ log det G_pose(q)
+        Stationary chart density ∝ e^{−U^pose} √det G  =  e^{−‖q−μ‖²/(2γ²)}
+        i.e. an isotropic chart-Gaussian, which DOES NOT match the sampling
+        initialization q_K ~ N(μ_q, γ² G_pose(μ_q)^{-1}) (extension.tex Sec. 6).
+
+    Fix 3 / Option B (``confining_kappa > 0``, noise_stationary_fix.md Sec. 2.3):
+        U^pose(q; μ_q)  =  (1/2γ²) (q − μ_q)^⊤ Ĝ (q − μ_q)  +  κ U_box(q)
+        where Ĝ := G_pose(μ_q) is the FIXED anchor metric (computed once per
+        forward / reverse call) and U_box is the soft joint-range confining
+        potential.  Stationary chart density ∝ e^{−U^pose} √det G.  Near
+        q ≈ μ_q (sampling initialization region), G(q) ≈ Ĝ so √det G is
+        approximately constant and the stationary reduces to
+            N(μ_q, γ² Ĝ^{-1}) × box,
+        exactly matching the sampling initialization.
+
+    extension.tex Eq. (17) form is preserved in both:  b^q = −½ G⁻¹ ∇_q U^pose.
     """
 
     def __init__(
@@ -54,6 +72,8 @@ class PoseLangevinSDE:
         limiting_q_mean: Tensor | None = None,
         limiting_scale: float = 0.6,
         forward_langevin_drift: bool = False,
+        confining_kappa: float = 0.0,
+        confining_epsilon_frac: float = 0.05,
     ):
         """
         Args:
@@ -66,6 +86,15 @@ class PoseLangevinSDE:
                 Varadhan-regime DSM standard and is empirically stable.
                 The reverse GRW always uses Langevin drift (sampling-time
                 only, manifold-bounded).
+            confining_kappa: strength of the soft confining box potential
+                (Fix 3, noise_stationary_fix.md Sec. 2.3).  Set > 0 to enable
+                anchor-metric Option B: replaces the legacy V = ½γ⁻²‖q−μ‖²
+                + ½ log det G with the anchor-metric form
+                V = (1/2γ²)(q−μ)^T Ĝ (q−μ) + κ U_box, where Ĝ = G(μ) is fixed
+                per call.  Recommended value: κ ∈ [10², 10⁴].
+            confining_epsilon_frac: ε_box = epsilon_frac · (q_max − q_min)
+                margin inside Franka joint range.  Default 5% (per doc).
+                Only relevant when ``confining_kappa > 0``.
         """
         self.manifold = manifold
         self.schedule = schedule
@@ -75,6 +104,8 @@ class PoseLangevinSDE:
             self.limiting_q_mean = None
         self.limiting_scale = float(limiting_scale)
         self.forward_langevin_drift = bool(forward_langevin_drift)
+        self.confining_kappa = float(confining_kappa)
+        self.confining_epsilon_frac = float(confining_epsilon_frac)
 
     @property
     def t0(self) -> float:
@@ -255,6 +286,110 @@ def _grad_log_det_G_pose_chart(
     return grad
 
 
+def _grad_U_box_chart(
+    q: Tensor,                                                                  # (..., n_q)
+    q_lower: Tensor,                                                            # (n_q,)
+    q_upper: Tensor,                                                            # (n_q,)
+    epsilon: Tensor,                                                            # (n_q,) or scalar
+    kappa: float,
+) -> Tensor:
+    """∇_q [κ Σ_i (ReLU(q_i − q_max + ε)² + ReLU(q_min + ε − q_i)²)].
+
+    Closed-form (no autograd).  Active only near boundary; zero deep inside the
+    Franka joint range.  Per noise_stationary_fix.md Sec. 2.3.6, ε is set to
+    a 5%-of-range margin so the potential activates BEFORE q hits the FK-NaN
+    region.
+    """
+    if kappa == 0.0:
+        return torch.zeros_like(q)
+    # Broadcast (n_q,) limits / ε across leading dims of q.
+    upper_excess = (q - (q_upper - epsilon)).clamp(min=0.0)
+    lower_excess = ((q_lower + epsilon) - q).clamp(min=0.0)
+    return 2.0 * kappa * (upper_excess - lower_excess)                           # (..., n_q)
+
+
+def _anchor_drift_potential_grad(
+    sde,
+    q: Tensor,                                                                   # (B, ..., n_q)
+    z: Tensor,                                                                   # (B, ..., n_z)
+    anchor_G: Tensor | None,                                                     # (B, n_q, n_q) or None
+) -> Tensor:
+    """Compute ∇_q U^pose for the forward / reverse drift, in chart form.
+
+    Returns the same leading shape as ``q``.  Selects legacy vs Fix 3 (Option
+    B) form based on ``sde.confining_kappa``:
+
+      - κ = 0 (legacy):  ∇U = (q − μ)/γ² + ∇(½ log det G(q))
+      - κ > 0 (Fix 3):   ∇U = γ⁻² Ĝ_b (q − μ) + ∇U_box(q),  Ĝ_b = anchor_G[b]
+
+    For Fix 3, ``anchor_G`` must be provided as a per-batch tensor of shape
+    (B, n_q, n_q) — Ĝ_b = G(μ_q, z_e[b]) is sample-specific because z_e
+    varies per sample (e.g. Franka tool extension).  For legacy, it is ignored.
+    """
+    manifold: EmbodimentPoseGraphManifold = sde.manifold
+    n_q = manifold.n_q
+    mu_q = sde.limiting_q_mean.to(device=q.device, dtype=q.dtype)
+    gamma2 = sde.limiting_scale ** 2
+
+    if sde.confining_kappa > 0.0:
+        # Fix 3 / Option B (per-batch Ĝ)
+        if anchor_G is None:
+            raise ValueError("Fix 3 enabled but anchor_G was not provided.")
+        if anchor_G.dim() != 3:
+            raise ValueError(
+                f"anchor_G must have shape (B, n_q, n_q); got {tuple(anchor_G.shape)}"
+            )
+        diff = q - mu_q                                                          # (B, ..., n_q)
+        # Per-batch quadratic gradient: anchor_quad[b, ..., i] = Ĝ_b[i, j] · diff[b, ..., j].
+        anchor_quad = torch.einsum("bij,b...j->b...i", anchor_G, diff) / gamma2  # (B, ..., n_q)
+        # Joint range box potential.
+        q_lower, q_upper = manifold.joint_limits(device=q.device, dtype=q.dtype) # (n_q,) each
+        eps_box = sde.confining_epsilon_frac * (q_upper - q_lower)               # (n_q,)
+        box_grad = _grad_U_box_chart(q, q_lower, q_upper, eps_box,
+                                       sde.confining_kappa)                      # (B, ..., n_q)
+        return anchor_quad + box_grad
+    else:
+        # Legacy form: ∇U = (q − μ)/γ² + ∇(½ log det G(q))
+        chart_grad_quad = (q - mu_q) / gamma2                                    # (B, ..., n_q)
+        leading = q.shape[:-1]
+        q_flat = q.reshape(-1, n_q)
+        z_flat = z.reshape(-1, z.shape[-1])
+        chart_grad_logdet = _grad_log_det_G_pose_chart(
+            manifold, q_flat, z_flat,
+        ).reshape(*leading, n_q)
+        return chart_grad_quad + chart_grad_logdet
+
+
+def _compute_anchor_G(sde, z_e: Tensor) -> Tensor | None:
+    """Compute per-batch Ĝ_b = G_pose(μ_q, z_e[b]) once for Fix 3.
+
+    Args:
+        z_e: (B, n_z) per-sample embodiment context.  μ_q is shared across the
+            batch (single anchor in q-space), but Ĝ varies per b because z_e
+            enters G_pose through the kinematic Jacobian (e.g. Franka tool
+            extension).  Per-batch Ĝ is the principled form (no
+            shared-z approximation); cost is B×O(n_q² · jacobian eval), which
+            is small for n_q = 7.
+
+    Returns:
+        anchor_G: (B, n_q, n_q), detached.  None if Fix 3 is OFF.
+    """
+    if sde.confining_kappa <= 0.0:
+        return None
+    if sde.limiting_q_mean is None:
+        raise ValueError("Fix 3 requires limiting_q_mean (anchor μ_q) to be set.")
+    manifold = sde.manifold
+    n_q = manifold.n_q
+    if z_e.dim() != 2:
+        raise ValueError(
+            f"z_e must have shape (B, n_z); got {tuple(z_e.shape)}"
+        )
+    B = z_e.shape[0]
+    mu_q = sde.limiting_q_mean.to(device=z_e.device, dtype=z_e.dtype)
+    mu_q_b = mu_q.unsqueeze(0).expand(B, n_q)                                    # (B, n_q)
+    return manifold.G_pose(mu_q_b, z_e).detach()                                 # (B, n_q, n_q)
+
+
 def traj_forward_grw_pose(
     sde,
     tau_0: Tensor,
@@ -285,9 +420,10 @@ def traj_forward_grw_pose(
 
     has_drift = (sde.forward_langevin_drift
                   and sde.limiting_q_mean is not None)
-    if has_drift:
-        mu_q = sde.limiting_q_mean.to(device=q.device, dtype=q.dtype)
-        gamma2 = sde.limiting_scale ** 2
+    # Fix 3 per-batch anchor metric: Ĝ_b = G(μ_q, z_e[b, 0]) — z_e is shared
+    # across timesteps within a sample, so we pick the first timestep.
+    anchor_G = (_compute_anchor_G(sde, z[:, 0, :])                              # (B, n_q, n_q)
+                if (has_drift and sde.confining_kappa > 0.0) else None)
 
     dr = (r / n_steps).view(B, 1, 1)                                            # (B, 1, 1)
     for k in range(n_steps):
@@ -296,14 +432,8 @@ def traj_forward_grw_pose(
         L = _per_timestep_G_chol(manifold, q, z)                                # (B, H+1, n_q, n_q)
 
         if has_drift:
-            # Chart drift b^q = −½ G⁻¹ ∇_q U^pose
-            #   ∇_q U = (q − μ_q)/γ² + ½ ∇_q log det G_pose
-            chart_grad_quad = (q - mu_q.view(1, 1, n_q)) / gamma2               # (B, H+1, n_q)
-            q_flat = q.reshape(B * H1, n_q)
-            z_flat = z.reshape(B * H1, n_z)
-            grad_half_logdet = _grad_log_det_G_pose_chart(manifold, q_flat, z_flat)
-            chart_grad_logdet = grad_half_logdet.reshape(B, H1, n_q)            # (B, H+1, n_q) = ∇(½ log det G)
-            chart_grad_U = chart_grad_quad + chart_grad_logdet                  # (B, H+1, n_q)
+            # Chart drift b^q = −½ G⁻¹ ∇_q U^pose (form selected by Fix 3 flag).
+            chart_grad_U = _anchor_drift_potential_grad(sde, q, z, anchor_G)    # (B, H+1, n_q)
             G_inv_grad_U = torch.cholesky_solve(
                 chart_grad_U.reshape(B * H1, n_q, 1), L.reshape(B * H1, n_q, n_q)
             ).squeeze(-1).reshape(B, H1, n_q)
@@ -609,6 +739,12 @@ def traj_reverse_grw_pose(
     else:
         mu_q = limiting_q_mean.to(device=device, dtype=dtype)
 
+    # Sync the SDE's μ_q to the kwarg so Fix 3 / drift helpers see the right
+    # anchor (the SDE constructor copy may live on CPU at fp32; reverse runs
+    # may use a different device/dtype).
+    sde.limiting_q_mean = mu_q
+    sde.limiting_scale = float(limiting_scale)
+
     # Initial chart-Gaussian sample
     mu_q_flat = mu_q.expand(B * H1, n_q)
     z_flat = z_traj.reshape(B * H1, n_z)
@@ -622,6 +758,10 @@ def traj_reverse_grw_pose(
     q = mu_q_flat + limiting_scale * a_init
     q = q.reshape(B, H1, n_q)
     x = manifold.make_x(q.reshape(B * H1, n_q), z_flat).reshape(B, H1, manifold.ambient_dim)
+
+    # Fix 3 per-batch anchor metric: Ĝ_b = G(μ_q, z_e[b]).
+    anchor_G = (_compute_anchor_G(sde, z_e)                                     # (B, n_q, n_q)
+                if sde.confining_kappa > 0.0 else None)
 
     # Discretise reverse time r: tf → eps
     r_grid = torch.linspace(schedule.tf, eps, n_steps + 1, device=device, dtype=dtype)
@@ -664,29 +804,29 @@ def traj_reverse_grw_pose(
             )
 
         # Limiting drift (chart, extension.tex Eq. (17)):
-        #   b^q = −(1/2γ²) G^{-1} (q − μ)  −  (1/4) G^{-1} ∇_q log det G_pose
-        # Both terms included for full Riemannian-volume-correct sampling.
-        gamma2 = limiting_scale ** 2
+        #   Legacy:  b^q = −(1/2γ²) G⁻¹(q − μ)  −  (1/4) G⁻¹ ∇log det G
+        #   Fix 3 :  b^q = −½ G⁻¹ [γ⁻² Ĝ(q − μ)  +  ∇U_box]
+        # Form is selected inside `_anchor_drift_potential_grad` based on
+        # `sde.confining_kappa`.
         q_flat = q.reshape(B * H1, n_q)
         L = manifold.G_pose_chol(q_flat, z_flat)
-        rhs = (q_flat - mu_q_flat).unsqueeze(-1)
-        Ginv_diff = torch.cholesky_solve(rhs, L).squeeze(-1)                    # (B*H1, n_q)
-        b_q_term1 = -(0.5 / gamma2) * Ginv_diff                                 # −(1/2γ²) G⁻¹(q−μ)
-
-        # Volume correction term: −(1/4) G⁻¹ ∇log det G  =  −½ G⁻¹ ∇(½ log det G).
         try:
-            grad_half_logdet = _grad_log_det_G_pose_chart(
-                manifold, q_flat, z_flat,
-            )                                                                   # (B*H1, n_q)
-            Ginv_grad_logdet = torch.cholesky_solve(
-                grad_half_logdet.unsqueeze(-1), L,
-            ).squeeze(-1)
-            b_q_term2 = -0.5 * Ginv_grad_logdet                                 # −(1/4) G⁻¹ ∇log det G
+            chart_grad_U = _anchor_drift_potential_grad(
+                sde, q, z_traj, anchor_G,
+            )                                                                   # (B, H+1, n_q)
+            Ginv_grad_U = torch.cholesky_solve(
+                chart_grad_U.reshape(B * H1, n_q, 1), L,
+            ).squeeze(-1).reshape(B, H1, n_q)
+            b_q = -0.5 * Ginv_grad_U
         except RuntimeError:
-            # Fallback: skip volume correction (e.g. if autograd through
-            # pytorch_kinematics fails for some manifold variant).
-            b_q_term2 = torch.zeros_like(b_q_term1)
-        b_q = (b_q_term1 + b_q_term2).reshape(B, H1, n_q)
+            # Fallback: skip the log-det-G correction term (autograd through
+            # pytorch_kinematics has rarely been seen to fail on extreme
+            # configurations).  Keeps the quadratic-anchor part.
+            mu_q_full = mu_q.view(1, 1, n_q)
+            gamma2 = limiting_scale ** 2
+            rhs = (q - mu_q_full).reshape(B * H1, n_q, 1)
+            Ginv_diff = torch.cholesky_solve(rhs, L).squeeze(-1)
+            b_q = -(0.5 / gamma2) * Ginv_diff.reshape(B, H1, n_q)
 
         # Anderson reverse SDE: dY = [-b_fwd + β·score] dr̄ + √β dB^M
         # (extension.tex Sec. 5; matches position-only `traj_reverse_grw` convention).

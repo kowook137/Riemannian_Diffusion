@@ -107,6 +107,24 @@ def parse_args():
                         "(extension.tex Eq. 15-17).  Stable when σ_p ≥ 0.05 "
                         "+ Tikhonov regularization (default).  Off by default "
                         "for backward compatibility.")
+    # noise_stationary_fix.md Fix 2 + Fix 3 (opt-in)
+    p.add_argument("--tikhonov-frac", type=float, default=0.0,
+                   help="Fix 2: adaptive Tikhonov on G_pose: "
+                        "G ← G + λ(q) I,  λ(q) = c · tr(G)/n_q.  "
+                        "0.0 = legacy fixed jitter only.  "
+                        "Recommended c ∈ [1e-4, 1e-2] when σ_p ≥ 0.05.  "
+                        "noise_stationary_fix.md Sec. 2.2.")
+    p.add_argument("--confining-kappa", type=float, default=0.0,
+                   help="Fix 3 (Option B): soft anchor-metric confining "
+                        "potential strength κ in U_total = (1/2γ²)(q-μ)^T Ĝ "
+                        "(q-μ) + κ U_box.  0.0 disables Fix 3 (legacy V).  "
+                        "Recommended κ ∈ [1e2, 1e4].  Forward Langevin drift "
+                        "is required (--forward-langevin-drift).  "
+                        "noise_stationary_fix.md Sec. 2.3.")
+    p.add_argument("--confining-epsilon-frac", type=float, default=0.05,
+                   help="Fix 3: ε margin = epsilon_frac · (q_max − q_min) "
+                        "before the joint-range box potential activates.  "
+                        "Default 5%% of range (per doc).")
     p.add_argument("--cond-injection", type=str, default="channel",
                    choices=["global", "channel"])
     p.add_argument("--endpoint-weight", type=float, default=1.0)
@@ -176,6 +194,7 @@ def main():
     arm_analytic = Franka7DoFPose(
         urdf_path=URDF, end_link="panda_hand", tool_z_max=args.z_max,
         sigma_p=args.sigma_p, sigma_R=args.sigma_R, metric=args.metric,
+        tikhonov_frac=args.tikhonov_frac,
     )
     arm_analytic._ensure_chain(torch.zeros(1, 7, device=device))
     residual_net = _load_stage1_pose(arm_analytic, args.stage1_pose_ckpt, device, dtype)
@@ -184,6 +203,9 @@ def main():
         tool_z_max=args.z_max, sigma_p=args.sigma_p, sigma_R=args.sigma_R,
         metric=args.metric,
     )
+    # `LearnedSelfModelFranka7DoFPose.__init__` may not forward tikhonov_frac;
+    # set the attribute directly so all downstream G_pose_chol calls inherit it.
+    arm.tikhonov_frac = float(args.tikhonov_frac)
     arm._ensure_chain(torch.zeros(1, 7, device=device))
 
     # --- demo gen ---
@@ -206,6 +228,8 @@ def main():
         limiting_q_mean=torch.tensor(args.limiting_mean_q, dtype=dtype),
         limiting_scale=args.limiting_scale,
         forward_langevin_drift=args.forward_langevin_drift,
+        confining_kappa=args.confining_kappa,
+        confining_epsilon_frac=args.confining_epsilon_frac,
     )
     net = TrajectoryScoreNetUNetPose(
         manifold=arm, H=args.H,
