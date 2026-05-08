@@ -11,6 +11,7 @@ pillow==12.2.0
 # Robotics
 pytorch_kinematics==0.10.0
 pybullet==3.2.7
+roma==1.5.6                # SO(3)/SE(3) quaternion ↔ rotmat utilities (used by smcdp.lie_se3)
 
 # Diffusion Policy baseline (uses these)
 diffusers==0.38.0
