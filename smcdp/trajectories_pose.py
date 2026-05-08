@@ -419,6 +419,121 @@ def traj_dsm_pose_loss(
 
 
 # =====================================================================
+# Reward guidance helpers (extension.tex Sec. 9, Eq. 41-48)
+# =====================================================================
+#
+# All guidance is computed in CHART form (G_pose-Riemannian gradient),
+# matching the chart-form score output of `TrajectoryScoreNetUNetPose`.
+# Autograd is used throughout per extension.tex Sec. 9.3 implementation
+# note (avoids the J_l^{-T} factor from Appendix A).
+
+
+def _pose_anchor_guidance_chart(
+    tau: Tensor,                                                                # (B, H+1, ambient_dim_pose)
+    T_anchor_Rp: tuple[Tensor, Tensor],                                         # (R_anchor (B,3,3), p_anchor (B,3))
+    manifold: EmbodimentPoseGraphManifold,
+    alpha_p: float,
+    alpha_R: float,
+    h_indices: list[int] | None = None,
+) -> Tensor:
+    """Pose-anchor reward gradient (chart-form, Riemannian) per extension.tex Eq. (42-45).
+
+        R_anchor(q_h) = −( α_p ‖e_ρ‖² + α_R ‖e_ω‖² ),
+            (e_ρ, e_ω) = Log_SE(3)( T_φ(q_h, z_e)^{-1} T_anchor )
+
+        guidance_chart_h = G_pose(q_h)^{-1} · ∂_q R_anchor(q_h)
+                         = −G_pose^{-1} · ∂_q [α_p ‖e_ρ‖² + α_R ‖e_ω‖²]   (autograd)
+
+    Applied at timesteps in `h_indices` (default [H] — endpoint only).
+    Returns (B, H+1, n_q), zeros at non-anchor timesteps.
+    """
+    B, H1, _ = tau.shape
+    n_q = manifold.n_q
+    out = torch.zeros(B, H1, n_q, device=tau.device, dtype=tau.dtype)
+    R_a, p_a = T_anchor_Rp
+    if h_indices is None:
+        h_indices = [H1 - 1]
+
+    for h in h_indices:
+        q_h = tau[:, h, :n_q]
+        z_h = tau[:, h, n_q + 7:]
+        with torch.enable_grad():
+            q_leaf = q_h.detach().clone().requires_grad_(True)
+            R_phi, p_phi = manifold.T_phi_Rp(q_leaf, z_h)
+            xi = log_relative_Rp(R_phi, p_phi, R_a, p_a)                        # (B, 6)
+            err_sq = (alpha_p * (xi[..., :3] ** 2).sum(-1)
+                       + alpha_R * (xi[..., 3:] ** 2).sum(-1))                  # (B,)
+            chart_grad = torch.autograd.grad(
+                err_sq.sum(), q_leaf,
+                create_graph=False, retain_graph=False,
+            )[0].detach()
+        L = manifold.G_pose_chol(q_h, z_h)
+        G_inv_grad = torch.cholesky_solve(
+            chart_grad.unsqueeze(-1), L,
+        ).squeeze(-1)                                                           # (B, n_q)
+        # ∇_M R_anchor = −G^{-1} ∂_q err_sq  (R_anchor = −err_sq)
+        out[:, h] = -G_inv_grad
+    return out
+
+
+def _smoothness_guidance_chart(
+    tau: Tensor,
+    manifold: EmbodimentPoseGraphManifold,
+    alpha_vel: float,
+    alpha_acc: float,
+) -> Tensor:
+    """Trajectory smoothness reward gradient (chart-form, Riemannian).
+
+    Mirrors position-only `_smoothness_guidance` with the same ½-prefixed penalty
+    convention (so closed-form chart gradients use small integer coefficients):
+        R_vel(τ) = −½ Σ_{h=0..H-1} ‖q_{h+1} − q_h‖²
+        R_acc(τ) = −½ Σ_{h=1..H-1} ‖q_{h+1} − 2 q_h + q_{h-1}‖²
+
+        guidance_h = G_pose(q_h)^{-1} · ∂_q (α_v R_vel + α_a R_acc)
+                   = −G_pose^{-1} · (α_v ∂_q ½‖vel‖² + α_a ∂_q ½‖acc‖²)
+
+    Closed-form chart gradients (no autograd) per timestep, then G^{-1}.
+    Returns chart-form (B, H+1, n_q).
+    """
+    B, H1, _ = tau.shape
+    n_q = manifold.n_q
+    if alpha_vel == 0.0 and alpha_acc == 0.0:
+        return torch.zeros(B, H1, n_q, device=tau.device, dtype=tau.dtype)
+
+    q = tau[..., :n_q]                                                          # (B, H+1, n_q)
+    z = tau[..., n_q + 7:]
+
+    # ∂(½ Σ ‖q_{h+1}−q_h‖²)/∂q_h  closed-form (matches position-only convention)
+    grad_vel = torch.zeros_like(q)
+    grad_vel[:, 0, :]  = -(q[:, 1, :] - q[:, 0, :])
+    grad_vel[:, -1, :] =  (q[:, -1, :] - q[:, -2, :])
+    if H1 > 2:
+        grad_vel[:, 1:-1, :] = 2 * q[:, 1:-1, :] - q[:, 2:, :] - q[:, :-2, :]
+
+    # ∂(½ Σ ‖q_{h+1}−2q_h+q_{h-1}‖²)/∂q_h  via shifted differences (position-only style)
+    grad_acc = torch.zeros_like(q)
+    if H1 >= 3:
+        r = q[:, 2:, :] - 2 * q[:, 1:-1, :] + q[:, :-2, :]                       # (B, H-1, n_q)
+        grad_acc[:, 1:-1, :] += -2.0 * r
+        grad_acc[:, 0, :]    += +1.0 * r[:, 0, :]
+        grad_acc[:, -1, :]   += +1.0 * r[:, -1, :]
+        if H1 > 3:
+            grad_acc[:, 2:, :]  += +1.0 * r
+            grad_acc[:, :-2, :] += +1.0 * r
+
+    chart_grad = alpha_vel * grad_vel + alpha_acc * grad_acc                    # (B, H+1, n_q)
+
+    # Per-timestep G^{-1} (descent direction: −G^{-1} chart_grad = ∇_M R_smooth)
+    q_flat = q.reshape(B * H1, n_q)
+    z_flat = z.reshape(B * H1, -1)
+    L = manifold.G_pose_chol(q_flat, z_flat)
+    G_inv_grad = torch.cholesky_solve(
+        chart_grad.reshape(B * H1, n_q, 1), L,
+    ).squeeze(-1).reshape(B, H1, n_q)
+    return -G_inv_grad                                                          # ∇_M R_smooth
+
+
+# =====================================================================
 # Reverse-time GRW sampler on the pose manifold (chart form)
 # =====================================================================
 
@@ -437,6 +552,17 @@ def traj_reverse_grw_pose(
     eps: float = 2e-4,
     device=None, dtype=torch.float32,
     score_postprocess=None,                                                     # optional post-net rescaling
+    # ---- Stage 6' reward guidance (extension.tex Sec. 9) ----
+    T_start_Rp: Optional[tuple[Tensor, Tensor]] = None,                         # for start anchor
+    start_alpha_p: float = 0.0,
+    start_alpha_R: float = 0.0,
+    start_h_indices: Optional[list[int]] = None,                                # default: [0]
+    T_target_Rp: Optional[tuple[Tensor, Tensor]] = None,                        # for goal anchor
+    goal_alpha_p: float = 0.0,
+    goal_alpha_R: float = 0.0,
+    goal_h_indices: Optional[list[int]] = None,                                 # default: [H]
+    smoothness_alpha_vel: float = 0.0,
+    smoothness_alpha_acc: float = 0.0,
 ) -> Tensor:
     """Reverse-time GRW on M_φ^pose^{H+1}, chart form.
 
@@ -497,6 +623,30 @@ def traj_reverse_grw_pose(
             s = score_fn(x, r_k.expand(B))
         if score_postprocess is not None:
             s = score_postprocess(s, r_k)
+
+        # ---- Stage 6' reward guidance (extension.tex Sec. 9) ----
+        # Pose start-anchor:  pulls q_h such that T_φ(q_h, z_e) ≈ T_start
+        if T_start_Rp is not None and (start_alpha_p > 0.0 or start_alpha_R > 0.0):
+            s_h = start_h_indices if start_h_indices is not None else [0]
+            s = s + _pose_anchor_guidance_chart(
+                x, T_start_Rp, manifold,
+                alpha_p=start_alpha_p, alpha_R=start_alpha_R,
+                h_indices=s_h,
+            )
+        # Pose goal-anchor:  pulls q_h such that T_φ(q_h, z_e) ≈ T_target
+        if T_target_Rp is not None and (goal_alpha_p > 0.0 or goal_alpha_R > 0.0):
+            g_h = goal_h_indices if goal_h_indices is not None else [H1 - 1]
+            s = s + _pose_anchor_guidance_chart(
+                x, T_target_Rp, manifold,
+                alpha_p=goal_alpha_p, alpha_R=goal_alpha_R,
+                h_indices=g_h,
+            )
+        # Trajectory smoothness:  vel + acc penalties
+        if smoothness_alpha_vel > 0.0 or smoothness_alpha_acc > 0.0:
+            s = s + _smoothness_guidance_chart(
+                x, manifold,
+                alpha_vel=smoothness_alpha_vel, alpha_acc=smoothness_alpha_acc,
+            )
 
         # Limiting drift (chart, extension.tex Eq. (17)):
         #   b^q = −(1/2γ²) G^{-1} (q − μ)  −  (1/4) G^{-1} ∇_q log det G_pose

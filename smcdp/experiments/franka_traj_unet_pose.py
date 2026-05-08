@@ -39,6 +39,7 @@ from smcdp.trajectories_pose import (
 )
 from smcdp.lie_se3 import (
     log_relative_Rp, quat_to_R, R_to_quat, exp_SE3, compose_Rp,
+    pose7_to_Rp,
 )
 
 
@@ -102,6 +103,20 @@ def parse_args():
     p.add_argument("--endpoint-weight", type=float, default=1.0)
     p.add_argument("--cond-drop-prob", type=float, default=0.10)
     p.add_argument("--guidance-scale", type=float, default=0.0)
+    # Stage 6' pose reward guidance (extension.tex Sec. 9)
+    p.add_argument("--start-alpha-p", type=float, default=0.0,
+                   help="Start anchor position weight α_p^s.")
+    p.add_argument("--start-alpha-R", type=float, default=0.0,
+                   help="Start anchor rotation weight α_R^s.")
+    p.add_argument("--goal-alpha-p", type=float, default=0.0,
+                   help="Goal anchor position weight α_p^g (per V2 default 100).")
+    p.add_argument("--goal-alpha-R", type=float, default=0.0,
+                   help="Goal anchor rotation weight α_R^g (per V2 default 100).")
+    p.add_argument("--smoothness-alpha-vel", type=float, default=0.0)
+    p.add_argument("--smoothness-alpha-acc", type=float, default=0.0)
+    p.add_argument("--goal-h-mask", type=str, default="last_only",
+                   choices=["all", "last_only", "last_half", "last_quarter"],
+                   help="Timestep mask schedule for goal anchor (extension.tex Eq. 49-52).")
     # eval
     p.add_argument("--n-eval-per-z", type=int, default=64)
     p.add_argument("--n-targets-per-z", type=int, default=8)
@@ -255,12 +270,34 @@ def main():
             args.n_eval_per_z, device=device, dtype=dtype,
         )
         goal_cond = torch.cat([T_start, T_target], dim=-1)
+        # Decode T_start, T_target for Stage 6' anchor guidance.
+        T_start_Rp = pose7_to_Rp(T_start) if (args.start_alpha_p > 0 or args.start_alpha_R > 0) else None
+        T_target_Rp = pose7_to_Rp(T_target) if (args.goal_alpha_p > 0 or args.goal_alpha_R > 0) else None
+        # Build goal mask schedule (extension.tex Eq. 49-52)
+        H1 = args.H + 1
+        if args.goal_h_mask == "all":
+            goal_h = list(range(H1))
+        elif args.goal_h_mask == "last_only":
+            goal_h = [H1 - 1]
+        elif args.goal_h_mask == "last_half":
+            goal_h = list(range(H1 // 2, H1))
+        else:  # "last_quarter"
+            goal_h = list(range(3 * H1 // 4, H1))
+
         samples = traj_reverse_grw_pose(
             sde, score_fn_ema, n_samples=args.n_eval_per_z, H=args.H,
             n_steps=args.n_sample_steps, goal_cond=goal_cond, z_e=z_e,
             limiting_q_mean=torch.tensor(args.limiting_mean_q),
             limiting_scale=args.limiting_scale,
             eps=args.eps, device=device, dtype=dtype,
+            T_start_Rp=T_start_Rp,
+            start_alpha_p=args.start_alpha_p, start_alpha_R=args.start_alpha_R,
+            start_h_indices=[0],
+            T_target_Rp=T_target_Rp,
+            goal_alpha_p=args.goal_alpha_p, goal_alpha_R=args.goal_alpha_R,
+            goal_h_indices=goal_h,
+            smoothness_alpha_vel=args.smoothness_alpha_vel,
+            smoothness_alpha_acc=args.smoothness_alpha_acc,
         )
         # Endpoint pose error
         x_H = samples[:, -1, :]                                                # (B, 15)
