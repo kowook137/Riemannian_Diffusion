@@ -153,12 +153,16 @@ class EmbodimentPoseGraphManifold(Manifold):
         return eye + Jp.transpose(-1, -2) @ (W * Jp)
 
     def G_pose_chol(self, q: Tensor, z: Tensor, jitter: float = 1e-4) -> Tensor:
-        """Cholesky of G_pose with adaptive jitter retry.
+        """Cholesky of G_pose with adaptive jitter retry (numerical safety net).
 
-        With W_p = σ_p^{-2} ≫ 1 (e.g. σ_p = 0.01 m → W_p = 10⁴), G_pose can
-        have condition number ~10⁵ near kinematic singularities or when q is
-        perturbed off-distribution by GRW.  We add a small jitter ε I to keep
-        Cholesky robust.  Fall back to larger jitter on numerical failure.
+        Note (per `noise_stationary_fix.md` Layer B analysis):
+        - The fundamental cure for cond(G_pose) blow-up is **Fix 1**:
+          loosen σ_p (default 0.05 → W_p = 400, cond ~10²).  Additive
+          Tikhonov λ I on (I + J^T W J) cannot meaningfully reduce
+          cond when max eig is dominated by W_p · ‖J‖² ≫ 1.
+        - This jitter (1e-4) acts only as a final FP-precision safety
+          belt for off-distribution q during forward GRW; it does not
+          alter the metric's conditioning structurally.
         """
         G = self.G_pose(q, z)
         eye = torch.eye(self.n_q, device=q.device, dtype=q.dtype)
@@ -167,7 +171,6 @@ class EmbodimentPoseGraphManifold(Manifold):
                 return torch.linalg.cholesky(G + j * eye)
             except torch._C._LinAlgError:
                 continue
-        # Last resort: SVD-based PSD floor (always succeeds)
         return torch.linalg.cholesky(G + (jitter * 1000.0) * eye)
 
     # ---------------- state split / assemble ----------------

@@ -71,8 +71,12 @@ def parse_args():
     p.add_argument("--z-min", type=float, default=0.05)
     p.add_argument("--z-max", type=float, default=0.15)
     # weights for pose metric
-    p.add_argument("--sigma-p", type=float, default=0.01,
-                   help="Position scale for W_p = σ_p^{-2} (m).")
+    p.add_argument("--sigma-p", type=float, default=0.05,
+                   help="Position scale for W_p = σ_p^{-2} (m).  Default 0.05m "
+                        "(=5cm) keeps W_p = 400 → cond(G_pose) ~10² — "
+                        "numerically stable for Langevin forward (cf. "
+                        "noise_stationary_fix.md Fix 1).  Use 0.01 (1cm) only "
+                        "after enabling Tikhonov + confining (Fix 2 + 3).")
     p.add_argument("--sigma-R", type=float, default=0.1,
                    help="Rotation scale for W_R = σ_R^{-2} (rad).")
     # net + training
@@ -98,6 +102,11 @@ def parse_args():
     p.add_argument("--limiting-mean-q", type=float, nargs=7,
                    default=[0.0, -0.3, 0.0, -1.7, 0.0, 1.4, 0.0])
     p.add_argument("--limiting-scale", type=float, default=0.6)
+    p.add_argument("--forward-langevin-drift", action="store_true",
+                   help="Enable Langevin forward drift -½β G⁻¹∇U "
+                        "(extension.tex Eq. 15-17).  Stable when σ_p ≥ 0.05 "
+                        "+ Tikhonov regularization (default).  Off by default "
+                        "for backward compatibility.")
     p.add_argument("--cond-injection", type=str, default="channel",
                    choices=["global", "channel"])
     p.add_argument("--endpoint-weight", type=float, default=1.0)
@@ -196,6 +205,7 @@ def main():
         arm, schedule,
         limiting_q_mean=torch.tensor(args.limiting_mean_q, dtype=dtype),
         limiting_scale=args.limiting_scale,
+        forward_langevin_drift=args.forward_langevin_drift,
     )
     net = TrajectoryScoreNetUNetPose(
         manifold=arm, H=args.H,
