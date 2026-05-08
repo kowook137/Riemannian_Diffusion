@@ -1,0 +1,78 @@
+{
+  "config": {
+    "ckpt": "outputs/franka_traj_unet/ckpt_riemannian.pt",
+    "n": 512,
+    "weight": "sigma2"
+  },
+  "section_4_1": {
+    "train_loss_mean": 1.6534284353256226,
+    "val_loss_mean": 1.6864227056503296,
+    "gap": 0.03299427032470703
+  },
+  "section_4_2_loss_by_r": {
+    "r=0.100": {
+      "mean": 2.7809319496154785,
+      "median": 2.394364595413208
+    },
+    "r=0.300": {
+      "mean": 0.6824051737785339,
+      "median": 0.6002997756004333
+    },
+    "r=0.500": {
+      "mean": 0.9027045965194702,
+      "median": 0.3887667953968048
+    },
+    "r=0.700": {
+      "mean": 1.6092184782028198,
+      "median": 0.7796202301979065
+    },
+    "r=0.900": {
+      "mean": 1.5377490520477295,
+      "median": 1.4142128229141235
+    }
+  },
+  "section_4_3_loss_by_cluster": {
+    "cluster_0_x_quantile": {
+      "n": 118,
+      "x_range": [
+        0.4000000059604645,
+        0.42500001192092896
+      ],
+      "loss_mean": 2.0122408866882324,
+      "loss_median": 1.100654125213623
+    },
+    "cluster_1_x_quantile": {
+      "n": 131,
+      "x_range": [
+        0.42500001192092896,
+        0.44999998807907104
+      ],
+      "loss_mean": 1.5203571319580078,
+      "loss_median": 0.9041734337806702
+    },
+    "cluster_2_x_quantile": {
+      "n": 119,
+      "x_range": [
+        0.44999998807907104,
+        0.4749999940395355
+      ],
+      "loss_mean": 1.6952561140060425,
+      "loss_median": 1.03840970993042
+    },
+    "cluster_3_x_quantile": {
+      "n": 144,
+      "x_range": [
+        0.4749999940395355,
+        0.5
+      ],
+      "loss_mean": 1.847139596939087,
+      "loss_median": 1.0315450429916382
+    }
+  },
+  "decision_notes": [
+    "Train \u2248 Val (no overfitting)",
+    "r-flat (loss similar across r levels)",
+    "Cluster-uniform loss",
+    "\u2192 Train\u2248Val + r-uniform + low DSM loss + task fail = OBJECTIVE MISMATCH (DSM accuracy doesn't translate to conditional sample quality)"
+  ]
+}

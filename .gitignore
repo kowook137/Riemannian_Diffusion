@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Local IDE / tooling
+.vscode/
+.idea/
+.claude/
+
+# External repos cloned for reference / baselines (clone separately on server)
+baselines_external/
+riemannian-score-sde/
+
+# Datasets (download separately if needed; project doesn't depend on them)
+data/
+
+# Outputs — exclude large checkpoints + generated data
+# Keep diagnostic JSONs and figures (small, useful for reading results without reruns).
+outputs/**/*.pt
+outputs/**/*.pth
+outputs/franka_modified/
+outputs/datasets/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

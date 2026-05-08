@@ -1,0 +1,30 @@
+# Core ML
+torch==2.11.0+cu128       # adjust CUDA suffix to match server (cu128 / cu121 / cu118)
+torchvision==0.26.0+cu128
+numpy==1.26.4
+scipy==1.15.3
+
+# Plotting / animation
+matplotlib==3.10.9
+pillow==12.2.0
+
+# Robotics
+pytorch_kinematics==0.10.0
+pybullet==3.2.7
+
+# Diffusion Policy baseline (uses these)
+diffusers==0.38.0
+einops==0.8.2
+huggingface_hub==1.13.0
+
+# Misc
+tqdm==4.67.3
+filelock==3.25.2
+
+# --- External repo required at runtime ---
+# diffusion_policy package (Chi23) — install separately:
+#   git clone https://github.com/real-stanford/diffusion_policy baselines_external/diffusion_policy
+#   pip install -e baselines_external/diffusion_policy
+#
+# This project itself:
+#   pip install -e .

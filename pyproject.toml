@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smcdp"
+version = "0.0.1"
+description = "Self-Model Manifold Diffusion Policy (Riemannian SGM on learned robot self-model manifolds)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+    "matplotlib",
+    "tqdm",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+include = ["smcdp*"]

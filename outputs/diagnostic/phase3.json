@@ -1,0 +1,69 @@
+{
+  "config": {
+    "ckpt": "outputs/franka_traj_unet/ckpt_riemannian.pt",
+    "n": 128
+  },
+  "section_5_1_magnitude": {
+    "r=0.1": {
+      "cond_norm_mean": 68.53759002685547,
+      "uncond_norm_mean": 68.4305419921875,
+      "diff_norm_mean": 4.249488830566406,
+      "diff_over_cond": 0.06229144334793091
+    },
+    "r=0.3": {
+      "cond_norm_mean": 21.794849395751953,
+      "uncond_norm_mean": 21.7966365814209,
+      "diff_norm_mean": 0.6730750799179077,
+      "diff_over_cond": 0.03095836378633976
+    },
+    "r=0.5": {
+      "cond_norm_mean": 11.48291015625,
+      "uncond_norm_mean": 11.499433517456055,
+      "diff_norm_mean": 0.1981717348098755,
+      "diff_over_cond": 0.01735549233853817
+    },
+    "r=0.7": {
+      "cond_norm_mean": 6.943493366241455,
+      "uncond_norm_mean": 6.956615447998047,
+      "diff_norm_mean": 0.14105790853500366,
+      "diff_over_cond": 0.020477432757616043
+    },
+    "r=0.9": {
+      "cond_norm_mean": 4.787542819976807,
+      "uncond_norm_mean": 4.783822059631348,
+      "diff_norm_mean": 0.12580826878547668,
+      "diff_over_cond": 0.026441030204296112
+    }
+  },
+  "section_5_2_direction": {
+    "r=0.3": {
+      "frac_decreased": 0.5625,
+      "mean_delta_err": -0.000332763884216547,
+      "median_delta_err": -0.0015012919902801514
+    },
+    "r=0.7": {
+      "frac_decreased": 0.46875,
+      "mean_delta_err": 0.000800010864622891,
+      "median_delta_err": 0.0008986592292785645
+    }
+  },
+  "section_5_3_ablation": {
+    "correct_c": {
+      "pos_err_to_correct_target_mean": 0.30860447883605957,
+      "pos_err_to_correct_target_med": 0.24627554416656494
+    },
+    "random_c": {
+      "pos_err_to_correct_target_mean": 0.31910428404808044,
+      "pos_err_to_correct_target_med": 0.28787562251091003
+    },
+    "null_c": {
+      "pos_err_to_correct_target_mean": 0.3144064247608185,
+      "pos_err_to_correct_target_med": 0.27673423290252686
+    }
+  },
+  "decision_notes": [
+    "Cond magnitude WEAK at r=0.5 (\u0394/cond=0.017 < 0.10)",
+    "Cond direction WEAK signal (frac ~50%)",
+    "Sample ablation: cond NOT USED (correct \u2248 random)"
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "config": {
+    "alpha": 100.0,
+    "h_mode": "last_half",
+    "n": 256
+  },
+  "endpoint_pos_err": {
+    "gen_mean": 0.0944725051522255,
+    "data_mean": 0.016786295920610428
+  },
+  "full_traj_pos_err": {
+    "gen_mean": 0.1274825930595398,
+    "data_mean": 0.008410472422838211
+  },
+  "ratio_endpoint_to_full": 0.7410619854927063,
+  "smoothness": {
+    "vel_gen_mean": 0.6384525895118713,
+    "vel_data_mean": 0.009257130324840546,
+    "accel_gen_mean": 1.0392078161239624,
+    "accel_data_mean": 0.00024290326109621674
+  },
+  "G_condition": {
+    "mean": 1.5947747230529785,
+    "max": 2.1507532596588135,
+    "min": 1.0837513208389282
+  },
+  "verdict": "Endpoint \u2248 full-traj error (0.74x) \u2192 trajectory-wide weakness, **Phase 6.1 channel concat** \uc6b0\uc120"
+}

@@ -1,0 +1,370 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+
+% Operators
+\DeclareMathOperator{\Exp}{Exp}
+\DeclareMathOperator{\Log}{Log}
+\DeclareMathOperator{\Retr}{Retr}
+\DeclareMathOperator{\Image}{Im}
+\DeclareMathOperator{\Vol}{Vol}
+
+% Commands
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\D}{\mathcal{D}}
+\newcommand{\Loss}{\mathcal{L}}
+\newcommand{\Mphi}{\mathcal{M}_{\phi}}
+\newcommand{\Mset}{\mathcal{M}}
+
+\title{Core Mathematical Formulation}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Self-model learning}
+
+State: $x = (q, p) \in \R^d$, $d = n_q + n_p$. Embodiment $z_e \in \R^{n_z}$. Goal/condition $c \in \mathcal{C}$ (notation distinct from constraint function $g_\phi$).
+
+Residual forward kinematics:
+\begin{equation}
+F_\phi(q, z_e) = FK_{\text{analytic}}(q, z_e) + \Delta_\phi(q, z_e)
+\end{equation}
+
+Constraint function:
+\begin{equation}
+g_\phi(x, z_e) = p - F_\phi(q, z_e)
+\end{equation}
+
+Self-model loss:
+\begin{equation}
+\Loss_{\text{self}}(\phi) = \E_{(q, p, z_e) \sim \D_{\text{self}}} \left[ \| F_\phi(q, z_e) - p \|^2 \right] + \beta \, \E \left[ \| \nabla_q \Delta_\phi \|_F^2 \right]
+\end{equation}
+
+\section{Manifold from self-model}
+
+Self-model manifold:
+\begin{equation}
+\Mphi(z_e) = \{ x \in \R^d : g_\phi(x, z_e) = 0 \} = \{ (q, p) : p = F_\phi(q, z_e) \}
+\end{equation}
+
+Embedding map and Jacobian:
+\begin{equation}
+H_\phi(q, z_e) = \begin{pmatrix} q \\ F_\phi(q, z_e) \end{pmatrix}, \qquad J_H(q, z_e) = \begin{pmatrix} I_{n_q} \\ J_F(q, z_e) \end{pmatrix}
+\end{equation}
+
+where $J_F = \partial F_\phi / \partial q$.
+
+\section{Differential structure (tangent bundle)}
+
+Constraint Jacobian:
+\begin{equation}
+J_g(x, z_e) = \begin{bmatrix} -J_F(q, z_e) & I_{n_p} \end{bmatrix}
+\end{equation}
+
+Tangent space:
+\begin{equation}
+T_x \Mphi = \ker J_g = \{ (\dot q, \dot p) : \dot p = J_F \dot q \} = \Image J_H
+\end{equation}
+
+Geometric consistency:
+\begin{equation}
+J_g \, J_H = -J_F + J_F = 0
+\end{equation}
+
+\section{Induced Riemannian metric}
+
+Ambient metric restricted to tangent: $\langle u, v \rangle_{\Mset, x} = u^T v$ for $u, v \in T_x \Mphi$.
+
+Chart-coordinate metric (from $u = J_H a$, $v = J_H b$):
+\begin{equation}
+\langle u, v \rangle_{\Mset, x} = a^T G(q, z_e) \, b
+\end{equation}
+
+\begin{equation}
+\boxed{ G(q, z_e) = J_H^T J_H = I_{n_q} + J_F(q, z_e)^T J_F(q, z_e) }
+\end{equation}
+
+Norm equivalence:
+\begin{equation}
+\| u \|^2_{\text{ambient}} = u^T u = a^T G(q, z_e) \, a = \| a \|_G^2
+\end{equation}
+
+Riemannian gradient (chart):
+\begin{equation}
+\nabla_{\Mset} f \;\leftrightarrow\; G(q, z_e)^{-1} \nabla_q \bar{f}, \qquad \bar{f}(q) = f(H_\phi(q, z_e))
+\end{equation}
+
+\paragraph{Density convention.} All densities $p_r$ on $\Mphi$ are defined with respect to the Riemannian volume measure $d\Vol_{\Mset} = \sqrt{\det G(q, z_e)} \, dq$, induced by the metric $G$. The Stein score $\nabla_{\Mset} \log p_r$ is taken with respect to this Riemannian density.
+
+\section{Trajectory product manifold}
+
+Trajectory $\tau = (x_0, x_1, \ldots, x_H)$, $x_h \in \Mphi(z_e)$:
+\begin{equation}
+\tau \in \Mphi(z_e)^{H+1}
+\end{equation}
+
+Product tangent space and metric:
+\begin{equation}
+T_\tau \Mphi^{H+1} = \prod_{h=0}^{H} T_{x_h} \Mphi, \qquad \langle U, V \rangle_\tau = \sum_{h=0}^{H} \langle u_h, v_h \rangle_{\Mset, x_h}
+\end{equation}
+
+\section{Riemannian SDE}
+
+Diffusion time $r \in [0, 1]$ (distinct from trajectory index $h$).
+
+Forward SDE on $\Mphi$ (with respect to Riemannian volume measure):
+\begin{equation}
+dX_r = b(X_r) \, dr + dB^{\Mset}_r, \qquad b(X_r) = -\tfrac{1}{2} \nabla_{\Mset} U(X_r)
+\end{equation}
+
+Reverse SDE:
+\begin{equation}
+dY_r = \left[ -b(Y_r) + \nabla_{\Mset} \log p_{1-r}(Y_r) \right] dr + dB^{\Mset}_r
+\end{equation}
+
+Trajectory-level on product manifold:
+\begin{equation}
+d\tau_r = b(\tau_r) \, dr + dB^{\Mset^{H+1}}_r, \qquad dX_{h, r} = b_h(\tau_r) \, dr + dB^{\Mset}_{h, r}
+\end{equation}
+
+\section{Score model}
+
+Score field as tangent bundle section:
+\begin{equation}
+s_\theta(r, x, c, z_e) \in T_x \Mphi
+\end{equation}
+
+Chart-coordinate output with self-model lift:
+\begin{equation}
+s_\theta^{\text{amb}}(r, x, c, z_e) = J_H(q, z_e) \, s_\theta^q(r, q, c, z_e) = \begin{pmatrix} s_\theta^q \\ J_F \, s_\theta^q \end{pmatrix}
+\end{equation}
+
+Tangent verification:
+\begin{equation}
+J_g \, s_\theta^{\text{amb}} = J_g J_H \, s_\theta^q = 0
+\end{equation}
+
+\section{Score matching loss (Riemannian DSM)}
+
+Varadhan asymptotic (small $r$):
+\begin{equation}
+\nabla_{\Mset} \log p_{r \mid 0}(x_r \mid x_0) \;\approx\; \frac{\Exp_{x_r}^{-1}(x_0)}{r}
+\end{equation}
+
+\paragraph{Chart-coordinate target.} The ambient target $\Exp_{x_r}^{-1}(x_0) \in T_{x_r} \Mphi$ has chart-coordinate representation $a^*(q_r, x_0) \in \R^{n_q}$ defined via the natural parameterization $u = J_H a$:
+\begin{equation}
+J_H(q_r, z_e) \, a^*(q_r, x_0) = \Exp_{x_r}^{-1}(x_0)
+\end{equation}
+Solving via the pseudoinverse (using $J_H^T J_H = G$):
+\begin{equation}
+\boxed{ a^*(q_r, x_0) = G(q_r, z_e)^{-1} J_H(q_r, z_e)^T \Exp_{x_r}^{-1}(x_0) }
+\end{equation}
+
+Three forms of the loss:
+
+\textbf{(a) Ambient (full Riemannian):}
+\begin{equation}
+\Loss^{\text{ambient}} = \E_{r, x_0, x_r} \left[ \left\| s_\theta(r, x_r, c, z_e) - \frac{\Exp_{x_r}^{-1}(x_0)}{r} \right\|^2_{x_r} \right]
+\end{equation}
+
+\textbf{(b) Chart $G$-weighted (equivalent to (a)):}
+\begin{equation}
+\Loss^{\text{chart-}G} = \E_{r, q_0, q_r} \left[ (s_\theta^q - a^*)^T G(q_r, z_e) \, (s_\theta^q - a^*) \right]
+\end{equation}
+
+Equivalence (using $\| u \|^2 = a^T G \, a$):
+\begin{equation}
+\| J_H s_\theta^q - J_H a^* \|^2_{\text{ambient}} = (s_\theta^q - a^*)^T G \, (s_\theta^q - a^*)
+\end{equation}
+
+\textbf{(c) Chart-Euclidean (computational approximation, not exact Riemannian DSM):}
+\begin{equation}
+\Loss^{\text{chart-Eucl}} \approx \E_{r, q_0, q_r} \left[ \left\| s_\theta^q - \frac{q_0 - q_r}{r} \right\|^2 \right]
+\end{equation}
+Valid under: (i) small $r$, (ii) $q_0, q_r$ in a local neighborhood, (iii) $G(q, z_e) \approx I$ or slowly varying $G$. Used as a computational simplification, not as exact Riemannian DSM.
+
+Trajectory-level (ambient):
+\begin{equation}
+\Loss_{\text{traj}}^{\text{ambient}} = \E \left[ \sum_{h=0}^{H} \left\| s_{\theta, h} - \frac{\Exp_{x_{h, r}}^{-1}(x_{h, 0})}{r} \right\|^2_{x_{h, r}} \right]
+\end{equation}
+
+\section{Sampling: retraction-based geodesic random walk}
+
+\paragraph{Implementation choice.} The framework uses retraction-based geodesic random walk (manifold-direct simulation) as the main sampling method, following RSGM Algorithm 1. This avoids explicit chart-coordinate It\^o SDE simulation.
+
+\paragraph{Chart It\^o SDE (precise form, for reference).} The exact chart-coordinate It\^o SDE for Riemannian Brownian motion with metric $G$ is
+\begin{equation}
+dq^i_r = b^{q, i}(q_r) \, dr + \frac{1}{2} \frac{1}{\sqrt{\det G}} \partial_j \left( \sqrt{\det G} \, G^{ij} \right) dr + \sigma^i_a(q_r) \, dW^a_r
+\end{equation}
+where $\sigma \sigma^T = G^{-1}$, e.g., $\sigma = G^{-1/2}$. The drift expansion:
+\begin{equation}
+\mu^i = \tfrac{1}{2} \partial_j G^{ij} + \tfrac{1}{4} G^{ij} \partial_j \log \det G
+\end{equation}
+This drift correction vanishes when $G \approx I$ or $G$ is constant. For toy implementations with small step size and slowly varying $G$, retraction-based GRW with step-wise Gaussian $\xi^q \sim \N(0, G^{-1})$ approximates the SDE without explicit drift correction.
+
+\paragraph{Graph retraction:}
+\begin{equation}
+\Retr_{(q, p)}(\delta q, \delta p) = (q + \delta q, \, F_\phi(q + \delta q, z_e))
+\end{equation}
+
+\paragraph{Tangent noise (Riemannian Gaussian):}
+\begin{equation}
+\xi_k^q \sim \N(0, \, G(q_k, z_e)^{-1})
+\end{equation}
+
+\paragraph{Reverse sampling step (component-wise on product manifold):}
+\begin{align}
+\mu_{h, k}^q &= -b^q(q_{h, k}) + s_{\theta, h}^q(r_k, \tau_k, c, z_e) \\
+\delta q_{h, k} &= \Delta r \cdot \mu_{h, k}^q + \sqrt{\Delta r} \cdot \xi_{h, k}^q \\
+q_{h, k+1} &= q_{h, k} + \delta q_{h, k} \\
+x_{h, k+1} &= H_\phi(q_{h, k+1}, z_e)
+\end{align}
+
+\paragraph{Reference distribution.} The initial distribution $p_{\text{ref}}$ for reverse sampling is a wrapped Gaussian on $\Mphi(z_e)^{H+1}$ centered at a reference point $\mu \in \Mphi(z_e)$:
+\begin{equation}
+p_{\text{ref}}(\tau \mid z_e) \propto \exp\left( -\sum_{h=0}^{H} \frac{d_{\Mset}(x_h, \mu)^2}{2 \gamma^2} \right)
+\end{equation}
+where $d_{\Mset}$ is the Riemannian geodesic distance. This is the stationary distribution of the Langevin forward process. In practice, sampling $p_{\text{ref}}$ is approximated by chart-coordinate Gaussian $q_h \sim \N(\mu_q, \gamma^2 G(\mu_q, z_e)^{-1})$, then lifting via $H_\phi$.
+
+\section{Goal-conditioned guidance (single-point, framework template)}
+
+Conditional score (with goal/condition $c$, distinct from constraint $g_\phi$):
+\begin{equation}
+s_\theta(r, x, c, z_e) \approx \nabla_{\Mset} \log p_r(x \mid c, z_e)
+\end{equation}
+
+Reward-based guidance (single-point, chart form):
+\begin{equation}
+s_{\text{guided}}^q = s_\theta^q + \alpha \, G(q, z_e)^{-1} \nabla_q \bar{R}(q, c)
+\end{equation}
+
+This is the framework's general template for goal-conditioned guidance. Specific applications instantiate $\bar R$ and extend to trajectory level.
+
+\section{Application-specific extension (trajectory-level guidance)}
+
+The framework template above extends naturally to product manifold trajectories.
+
+\subsection{Condition extension}
+
+For specific manipulation tasks, the condition $c$ is enriched (the score model signature $s_\theta(r, x, c, z_e)$ is unchanged; only the content of $c$ is enriched):
+\begin{equation}
+c = (p_{\text{start}}, p_{\text{target}}, z_e) \in \R^{3 + 3 + n_z}
+\end{equation}
+
+The score network input per timestep $h$:
+\begin{equation}
+\text{input}_h = [q_h, \, r, \, h/H, \, z_e, \, p_{\text{start}}, \, p_{\text{target}}]
+\end{equation}
+
+This is an implementation detail: channel-concat injection (vs.\ global cond) for stronger conditioning. The framework's mathematical structure is unchanged.
+
+\subsection{Trajectory-level Riemannian gradient}
+
+For trajectory $\tau = (x_0, \ldots, x_H) \in \Mphi^{H+1}$ and reward function $R: \Mphi^{H+1} \times \mathcal{C} \to \R$, the Riemannian gradient on the product manifold (chart form):
+\begin{equation}
+\nabla_{\Mset^{H+1}} R(\tau) \;\leftrightarrow\; G_{\text{traj}}(q_{0:H}, z_e)^{-1} \nabla_{q_{0:H}} \bar{R}(\tau)
+\end{equation}
+
+where the product manifold metric in chart form is block-diagonal:
+\begin{equation}
+G_{\text{traj}}(q_{0:H}, z_e) = \operatorname{diag}\bigl(G(q_0, z_e), \, G(q_1, z_e), \, \ldots, \, G(q_H, z_e)\bigr)
+\end{equation}
+
+This is the natural trajectory-level extension of the single-point Riemannian gradient $\nabla_{\Mset} f \leftrightarrow G^{-1} \nabla_q \bar f$, using the product manifold structure of $\Mphi^{H+1}$ (Section~\ref{sec:product-manifold}).
+
+\subsection{Trajectory-level guidance}
+
+The trajectory-level guided score:
+\begin{equation}
+\boxed{ s_{\text{guided}}^q(r, \tau, c, z_e) = s_\theta^q(r, \tau, c, z_e) + G_{\text{traj}}(q_{0:H}, z_e)^{-1} \nabla_{q_{0:H}} R_{\text{total}}(\tau, c) }
+\end{equation}
+
+Each component lives in $T_{x_h} \Mphi$ by construction (the Riemannian gradient is automatically tangent), so the lifted trajectory score $J_H s_{\text{guided}}^q \in T_\tau \Mphi^{H+1}$ and retraction-based sampling preserves manifold adherence.
+
+\subsection{Multi-component reward}
+
+For manipulation tasks requiring sharp goal-reach with smooth trajectories, the reward decomposes into task-specific components:
+\begin{equation}
+R_{\text{total}}(\tau, c) = \alpha_s R_{\text{start}}(\tau, c) + \alpha_g R_{\text{goal}}(\tau, c) + \alpha_v R_{\text{vel}}(\tau) + \alpha_a R_{\text{acc}}(\tau)
+\end{equation}
+
+with the following components:
+
+\paragraph{Start anchoring.}
+\begin{equation}
+R_{\text{start}}(\tau, c) = -\| F_\phi(q_0, z_e) - p_{\text{start}} \|^2
+\end{equation}
+
+\paragraph{Endpoint guidance.}
+\begin{equation}
+R_{\text{goal}}(\tau, c) = -\| F_\phi(q_H, z_e) - p_{\text{target}} \|^2
+\end{equation}
+
+\paragraph{Velocity smoothness.}
+\begin{equation}
+R_{\text{vel}}(\tau) = -\sum_{h=0}^{H-1} \| q_{h+1} - q_h \|^2
+\end{equation}
+
+\paragraph{Acceleration smoothness.}
+\begin{equation}
+R_{\text{acc}}(\tau) = -\sum_{h=1}^{H-1} \| q_{h+1} - 2 q_h + q_{h-1} \|^2
+\end{equation}
+
+The weights $\alpha_s, \alpha_g, \alpha_v, \alpha_a \geq 0$ are tunable hyperparameters per task.
+
+\subsection{Tangent verification (trajectory-level)}
+
+The guided score remains in the product tangent bundle by construction. For each component $h$:
+\begin{equation}
+J_g(x_h, z_e) \cdot \bigl[ J_H(q_h, z_e) \, s_{\text{guided}, h}^q \bigr] = 0
+\end{equation}
+
+so the lifted trajectory score $J_H s_{\text{guided}}^q \in T_\tau \Mphi^{H+1}$. Retraction-based component-wise sampling (Section~9) keeps the trajectory on the product manifold.
+
+\subsection{Relation to framework template}
+
+The trajectory-level guidance is the natural instantiation of the framework's single-point template (\S 10), with:
+\begin{itemize}[noitemsep]
+    \item Single point $x \in \Mphi$ $\to$ trajectory $\tau \in \Mphi^{H+1}$
+    \item Single metric $G(q, z_e)$ $\to$ product metric $G_{\text{traj}}$
+    \item Scalar reward $\bar R(q, c)$ $\to$ trajectory reward $R_{\text{total}}(\tau, c)$
+    \item Single-point Riemannian gradient $\to$ product Riemannian gradient
+\end{itemize}
+
+The framework's mathematical core (Sections~1--9) remains unchanged. The application-specific extension instantiates the framework for the particular task without modifying any geometric construction.
+
+\section{Pipeline summary}
+
+\subsection{Framework pipeline (geometric core)}
+
+\begin{align}
+\text{Stage 1.}\quad & F_\phi = FK_{\text{analytic}} + \Delta_\phi \quad \text{via } \min_\phi \Loss_{\text{self}} \\
+\text{Stage 2.}\quad & \Mphi(z_e) = \{(q, p) : p = F_\phi(q, z_e)\}, \quad G = I + J_F^T J_F \\
+\text{Stage 3.}\quad & \tau_i = (H_\phi(q_h, z_e))_{h=0}^H \in \Mphi^{H+1} \quad \text{(demo projection)} \\
+\text{Stage 4.}\quad & d\tau_r = b(\tau_r) \, dr + dB^{\Mset^{H+1}}_r \quad \text{(forward, Riemannian volume measure)} \\
+\text{Stage 5.}\quad & \min_\theta \Loss_{\text{traj}}^{\text{ambient}} \;\equiv\; \Loss_{\text{traj}}^{\text{chart-}G} \\
+\text{Stage 6.}\quad & \tau_K \sim p_{\text{ref}} \;\to\; \tau_0 \in \Mphi(z_e)^{H+1} \quad \text{(retraction-based GRW)}
+\end{align}
+
+\subsection{Application-specific extension}
+
+For task-specific deployment (e.g., 7-DoF Franka manipulation):
+\begin{align}
+\text{Stage 5'.}\quad & c = (p_{\text{start}}, p_{\text{target}}, z_e), \quad \text{channel-concat to score model input} \\
+\text{Stage 6'.}\quad & s_{\text{guided}}^q = s_\theta^q + G_{\text{traj}}^{-1} \nabla_{q_{0:H}} R_{\text{total}}(\tau, c) \\
+& R_{\text{total}} = \alpha_s R_{\text{start}} + \alpha_g R_{\text{goal}} + \alpha_v R_{\text{vel}} + \alpha_a R_{\text{acc}}
+\end{align}
+
+\paragraph{Feasibility claim.} The sampler generates trajectories on the learned self-model manifold $\Mphi(z_e)$ by construction. Therefore, feasibility is guaranteed with respect to the learned self-model; physical feasibility depends on the accuracy of $\Mphi(z_e)$ as an approximation of the true robot constraint manifold. Application-specific reward components ($R_{\text{total}}$) shape the trajectory distribution within the manifold for task success.
+
+\end{document}
