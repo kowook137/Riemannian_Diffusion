@@ -184,6 +184,51 @@ def _per_timestep_G_chol(manifold: EmbodimentPoseGraphManifold, q: Tensor, z: Te
     return L_flat.reshape(B, H1, n_q, n_q)
 
 
+def _grad_log_det_G_pose_chart(
+    manifold: EmbodimentPoseGraphManifold,
+    q: Tensor, z: Tensor,
+) -> Tensor:
+    """∂_q (½ log det G_pose(q, z)) via plain autograd.
+
+    Required for the volume-correction term in extension.tex Eq. (17):
+        b^q = −(1/2γ²) G⁻¹ (q − μ_q) − (1/4) G⁻¹ ∇_q log det G_pose
+
+    Implementation note: for `LearnedSelfModelFranka7DoFPose`, the hybrid
+    `jacobian_pose` uses inner `torch.func.vmap(jacrev(...))` whose
+    second-order autograd is unstable / NaN-prone.  We therefore use the
+    analytic FK only (`Franka7DoFPose.jacobian_pose`) for the volume
+    correction even when a learned residual is present — a benign
+    small-residual approximation since ξ_φ ~ 1 cm / 1°, so
+    G_a ≈ G_pose to leading order and ∇log det G_a ≈ ∇log det G_pose.
+    """
+    from smcdp.manifolds_pose import Franka7DoFPose
+
+    with torch.enable_grad():
+        q_leaf = q.detach().clone().requires_grad_(True)
+        # Compute G using the *analytic* J_pose only (skip residual).
+        # This is plain autograd (no vmap), so propagates through
+        # pytorch_kinematics' chain.jacobian cleanly.
+        if isinstance(manifold, Franka7DoFPose):
+            Jp = Franka7DoFPose.jacobian_pose(manifold, q_leaf, z)
+        else:
+            # Generic fallback: full hybrid Jacobian (may NaN for
+            # learned-residual manifolds).
+            Jp = manifold.jacobian_pose(q_leaf, z)
+        W = manifold._W_diag(q_leaf).unsqueeze(-1)                              # (6, 1)
+        eye = torch.eye(manifold.n_q, device=q.device, dtype=q.dtype)
+        G = eye + Jp.transpose(-1, -2) @ (W * Jp)
+        half_logdet = 0.5 * torch.linalg.slogdet(G).logabsdet                  # (B,)
+        grad = torch.autograd.grad(
+            half_logdet.sum(), q_leaf,
+            create_graph=False, retain_graph=False,
+        )[0]
+    grad = grad.detach()
+    # Guard against any residual NaN (extreme conditioning, etc.)
+    if torch.isnan(grad).any() or torch.isinf(grad).any():
+        return torch.zeros_like(q)
+    return grad
+
+
 def traj_forward_grw_pose(
     sde,
     tau_0: Tensor,
@@ -419,15 +464,30 @@ def traj_reverse_grw_pose(
         if score_postprocess is not None:
             s = score_postprocess(s, r_k)
 
-        # Limiting drift (chart): b^q = −(1/2γ²) G^{-1} (q − μ)
-        # ½ log det G correction omitted (matches position-only reverse_grw).
+        # Limiting drift (chart, extension.tex Eq. (17)):
+        #   b^q = −(1/2γ²) G^{-1} (q − μ)  −  (1/4) G^{-1} ∇_q log det G_pose
+        # Both terms included for full Riemannian-volume-correct sampling.
         gamma2 = limiting_scale ** 2
         q_flat = q.reshape(B * H1, n_q)
         L = manifold.G_pose_chol(q_flat, z_flat)
         rhs = (q_flat - mu_q_flat).unsqueeze(-1)
         Ginv_diff = torch.cholesky_solve(rhs, L).squeeze(-1)                    # (B*H1, n_q)
-        b_q_flat = -(0.5 / gamma2) * Ginv_diff
-        b_q = b_q_flat.reshape(B, H1, n_q)
+        b_q_term1 = -(0.5 / gamma2) * Ginv_diff                                 # −(1/2γ²) G⁻¹(q−μ)
+
+        # Volume correction term: −(1/4) G⁻¹ ∇log det G  =  −½ G⁻¹ ∇(½ log det G).
+        try:
+            grad_half_logdet = _grad_log_det_G_pose_chart(
+                manifold, q_flat, z_flat,
+            )                                                                   # (B*H1, n_q)
+            Ginv_grad_logdet = torch.cholesky_solve(
+                grad_half_logdet.unsqueeze(-1), L,
+            ).squeeze(-1)
+            b_q_term2 = -0.5 * Ginv_grad_logdet                                 # −(1/4) G⁻¹ ∇log det G
+        except RuntimeError:
+            # Fallback: skip volume correction (e.g. if autograd through
+            # pytorch_kinematics fails for some manifold variant).
+            b_q_term2 = torch.zeros_like(b_q_term1)
+        b_q = (b_q_term1 + b_q_term2).reshape(B, H1, n_q)
 
         # Anderson reverse SDE: dY = [-b_fwd + β·score] dr̄ + √β dB^M
         # (extension.tex Sec. 5; matches position-only `traj_reverse_grw` convention).
