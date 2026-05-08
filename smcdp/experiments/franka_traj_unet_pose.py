@@ -177,7 +177,11 @@ def main():
 
     # --- SDE + score net ---
     schedule = LinearBetaSchedule(beta_0=args.beta_0, beta_f=args.beta_f, tf=1.0)
-    sde = PoseLangevinSDE(arm, schedule)
+    sde = PoseLangevinSDE(
+        arm, schedule,
+        limiting_q_mean=torch.tensor(args.limiting_mean_q, dtype=dtype),
+        limiting_scale=args.limiting_scale,
+    )
     net = TrajectoryScoreNetUNetPose(
         manifold=arm, H=args.H,
         down_dims=tuple(args.down_dims),

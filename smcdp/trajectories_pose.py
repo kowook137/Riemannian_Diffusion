@@ -37,18 +37,30 @@ from smcdp.lie_se3 import (
 
 
 class PoseLangevinSDE:
-    """Lightweight SDE container for the pose pipeline.
+    """Lightweight Langevin SDE container for the pose pipeline.
 
-    The chart-form pose pipeline computes its own limiting drift in
-    `traj_reverse_grw_pose`, so a full LangevinSDE (with `limiting.grad_U`
-    returning ambient-tangent form) is unnecessary.  This wrapper just holds
-    `manifold` and `schedule`, matching the attribute access pattern of
-    `LangevinSDE` used by the DSM loss + sampler.
+    Holds the manifold + schedule + Langevin limiting parameters
+    (μ_q, γ).  The chart-form pose forward and reverse GRW both use these
+    via internal helpers (no separate limiting-distribution class).
+
+    extension.tex Eq. (16):  U^pose = (1/2γ²) ‖q−μ_q‖² + ½ log det G_pose
+    extension.tex Eq. (17):  b^q   = −½ G⁻¹ ∇_q U^pose
     """
 
-    def __init__(self, manifold: EmbodimentPoseGraphManifold, schedule):
+    def __init__(
+        self,
+        manifold: EmbodimentPoseGraphManifold,
+        schedule,
+        limiting_q_mean: Tensor | None = None,
+        limiting_scale: float = 0.6,
+    ):
         self.manifold = manifold
         self.schedule = schedule
+        if limiting_q_mean is not None:
+            self.limiting_q_mean = torch.as_tensor(limiting_q_mean, dtype=torch.float32)
+        else:
+            self.limiting_q_mean = None
+        self.limiting_scale = float(limiting_scale)
 
     @property
     def t0(self) -> float:
@@ -237,13 +249,16 @@ def traj_forward_grw_pose(
 ) -> Tensor:
     """Forward GRW on M_φ^pose(z_e)^{H+1} in chart form, retracting via H_φ^pose.
 
-    Brownian-on-M with diffusion √β (extension.tex Sec. 5):
-        dX_r = √β(r) dB^M_r       (we omit Langevin drift; score net learns the
-                                    drift correction implicitly via DSM)
-    Discretized chart update per substep:
-        δq ~ √(β(r) · Δr) · ξ_q,  ξ_q ~ N(0, G_pose^{-1})
-    so accumulated variance ≈ ∫β(s) ds = τ_brown(r), matching the DSM target's
-    1/τ_brown rescaling.
+    Langevin SDE (extension.tex Sec. 5, Eq. 15-17):
+        dX_r = b(X_r) dr + √β(r) dB^M_r,    b = −½ ∇_M U^pose
+        b^q   = −½ G⁻¹ ∇_q U^pose
+              = −(1/2γ²) G⁻¹ (q − μ_q) − (1/4) G⁻¹ ∇_q log det G_pose
+
+    Discretized chart update per substep (matches position-only convention,
+    with β scaling applied to BOTH drift and noise per VP-style Langevin):
+        δq = β · b^q · Δr   +   √(β · Δr) · ξ_q,    ξ_q ~ N(0, G^{-1})
+
+    If `sde.limiting_q_mean` is None, drift is omitted (pure Brownian-on-M).
     """
     manifold = sde.manifold
     schedule = sde.schedule
@@ -254,19 +269,38 @@ def traj_forward_grw_pose(
     q = tau_0[..., :n_q].clone()                                                # (B, H+1, n_q)
     z = tau_0[..., n_q + 7:].clone()                                            # (B, H+1, n_z)
 
-    # Discretise (0 → r) per sample
+    has_drift = sde.limiting_q_mean is not None
+    if has_drift:
+        mu_q = sde.limiting_q_mean.to(device=q.device, dtype=q.dtype)
+        gamma2 = sde.limiting_scale ** 2
+
     dr = (r / n_steps).view(B, 1, 1)                                            # (B, 1, 1)
     for k in range(n_steps):
-        # Mid-step time for β coefficient (Stratonovich-ish; OK for small Δr)
-        r_k = (k + 0.5) / n_steps * r                                            # (B,)
-        beta_k = schedule.beta(r_k).view(B, 1, 1)                                # (B, 1, 1)
+        r_k = (k + 0.5) / n_steps * r                                           # (B,)
+        beta_k = schedule.beta(r_k).view(B, 1, 1)                               # (B, 1, 1)
         L = _per_timestep_G_chol(manifold, q, z)                                # (B, H+1, n_q, n_q)
+
+        if has_drift:
+            # Chart drift b^q = −½ G⁻¹ ∇_q U^pose
+            #   ∇_q U = (q − μ_q)/γ² + ½ ∇_q log det G_pose
+            chart_grad_quad = (q - mu_q.view(1, 1, n_q)) / gamma2               # (B, H+1, n_q)
+            q_flat = q.reshape(B * H1, n_q)
+            z_flat = z.reshape(B * H1, n_z)
+            grad_half_logdet = _grad_log_det_G_pose_chart(manifold, q_flat, z_flat)
+            chart_grad_logdet = grad_half_logdet.reshape(B, H1, n_q)            # (B, H+1, n_q) = ∇(½ log det G)
+            chart_grad_U = chart_grad_quad + chart_grad_logdet                  # (B, H+1, n_q)
+            G_inv_grad_U = torch.cholesky_solve(
+                chart_grad_U.reshape(B * H1, n_q, 1), L.reshape(B * H1, n_q, n_q)
+            ).squeeze(-1).reshape(B, H1, n_q)
+            b_q = -0.5 * G_inv_grad_U                                           # (B, H+1, n_q)
+        else:
+            b_q = 0.0
+
         eps = torch.randn_like(q)
         a = torch.linalg.solve_triangular(
             L.transpose(-1, -2), eps.unsqueeze(-1), upper=True
         ).squeeze(-1)                                                           # (B, H+1, n_q)
-        # √(β · Δr) · a — matches position-only `traj_forward_grw` convention.
-        q = q + (beta_k * dr).sqrt() * a
+        q = q + beta_k * b_q * dr + (beta_k * dr).sqrt() * a
 
     q_flat = q.reshape(B * H1, n_q)
     z_flat = z.reshape(B * H1, n_z)
