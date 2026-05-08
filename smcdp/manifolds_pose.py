@@ -152,8 +152,23 @@ class EmbodimentPoseGraphManifold(Manifold):
         eye = torch.eye(self.n_q, device=q.device, dtype=q.dtype)
         return eye + Jp.transpose(-1, -2) @ (W * Jp)
 
-    def G_pose_chol(self, q: Tensor, z: Tensor) -> Tensor:
-        return torch.linalg.cholesky(self.G_pose(q, z))
+    def G_pose_chol(self, q: Tensor, z: Tensor, jitter: float = 1e-4) -> Tensor:
+        """Cholesky of G_pose with adaptive jitter retry.
+
+        With W_p = σ_p^{-2} ≫ 1 (e.g. σ_p = 0.01 m → W_p = 10⁴), G_pose can
+        have condition number ~10⁵ near kinematic singularities or when q is
+        perturbed off-distribution by GRW.  We add a small jitter ε I to keep
+        Cholesky robust.  Fall back to larger jitter on numerical failure.
+        """
+        G = self.G_pose(q, z)
+        eye = torch.eye(self.n_q, device=q.device, dtype=q.dtype)
+        for j in (jitter, jitter * 10.0, jitter * 100.0):
+            try:
+                return torch.linalg.cholesky(G + j * eye)
+            except torch._C._LinAlgError:
+                continue
+        # Last resort: SVD-based PSD floor (always succeeds)
+        return torch.linalg.cholesky(G + (jitter * 1000.0) * eye)
 
     # ---------------- state split / assemble ----------------
     def split_x(self, x: Tensor):

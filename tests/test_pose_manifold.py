@@ -162,7 +162,9 @@ def test_S4_lift_idempotence():
     a = torch.randn(4, 7, dtype=q.dtype) * 0.1
     v = m.lift_chart_to_tangent(x, a)
     v_proj = m.proj_to_tangent(x, v)
-    _assert_close(v_proj, v, 1e-9, "proj(lift(a)) = lift(a)")
+    # Tolerance reflects 1e-4 jitter in G_pose_chol (numerical regularization
+    # for ill-conditioned W_p = σ_p^{-2} ~ 10⁴).
+    _assert_close(v_proj, v, 1e-4, "proj(lift(a)) = lift(a)")
 
 
 def test_S5_log_exp_roundtrip():
