@@ -53,7 +53,20 @@ class PoseLangevinSDE:
         schedule,
         limiting_q_mean: Tensor | None = None,
         limiting_scale: float = 0.6,
+        forward_langevin_drift: bool = False,
     ):
+        """
+        Args:
+            forward_langevin_drift: if True, forward GRW includes the Langevin
+                limiting drift -½ β G^{-1} ∇U (extension.tex Eq. 15-17).
+                Default False because with W_p = σ_p^{-2} ≫ 1 (e.g. 10⁴), the
+                drift on the null-space of J_pose can push q out of valid
+                Franka joint range, producing NaN in pytorch_kinematics →
+                non-PD G_pose.  Pure Brownian forward (default) is the
+                Varadhan-regime DSM standard and is empirically stable.
+                The reverse GRW always uses Langevin drift (sampling-time
+                only, manifold-bounded).
+        """
         self.manifold = manifold
         self.schedule = schedule
         if limiting_q_mean is not None:
@@ -61,6 +74,7 @@ class PoseLangevinSDE:
         else:
             self.limiting_q_mean = None
         self.limiting_scale = float(limiting_scale)
+        self.forward_langevin_drift = bool(forward_langevin_drift)
 
     @property
     def t0(self) -> float:
@@ -269,7 +283,8 @@ def traj_forward_grw_pose(
     q = tau_0[..., :n_q].clone()                                                # (B, H+1, n_q)
     z = tau_0[..., n_q + 7:].clone()                                            # (B, H+1, n_z)
 
-    has_drift = sde.limiting_q_mean is not None
+    has_drift = (sde.forward_langevin_drift
+                  and sde.limiting_q_mean is not None)
     if has_drift:
         mu_q = sde.limiting_q_mean.to(device=q.device, dtype=q.dtype)
         gamma2 = sde.limiting_scale ** 2
