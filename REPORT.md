@@ -2231,3 +2231,70 @@ $$
 - 결과 JSON: `outputs/diagnostic/inference_timing_path.json`
 - Re-run 명령: `python -m smcdp.experiments.franka_inference_timing_path --warmup 4 --repeats 7`
 - 측정 가능 추가 metric (script에 이미 포함): joint path length / straight, EE excess std, succ@10cm
+
+# Part VII — SE(3) 확장: Pose-Extended SMCDP
+
+`extension.tex` (v2)의 pose-extended formulation을 framework + 코드로 구현. 기존 position-only ($p \in \mathbb{R}^3$) 대신 full SE(3) pose ($T = (R, p) \in \mathrm{SE}(3)$)를 self-model의 출력 공간으로 확장. body-frame trivialization throughout, $W = \mathrm{diag}(W_p I_3, W_R I_3)$ weighted metric, residual right-multiply $T_\phi = T_{\text{analytic}} \cdot \exp_{\mathrm{SE}(3)}(\xi_\phi^\wedge)$.
+
+## VII.1 구현 요약 (Phase 1–6)
+
+| Phase | 모듈 | 핵심 기여 |
+|---|---|---|
+| 1 | `smcdp/lie_se3.py`, `tests/test_lie_se3.py` | SE(3) Lie utilities — exp/log on SO(3) & SE(3), left-Jacobian + inverse, Adjoint, autograd body-frame Jacobian (vmap-safe via (R, p)-tuple form). 모든 unit test FP64 machine precision (autograd vs FD: 1.7e-10). |
+| 2 | `smcdp/manifolds_pose.py` | `EmbodimentPoseGraphManifold` (ABC) + `Franka7DoFPose` (closed-form analytic body-frame Jacobian). `G_{\text{pose}} = I + J_{\text{pose}}^\top W J_{\text{pose}}$ 정확히 정합. |
+| 3 | `tests/test_pose_manifold.py` | S1–S8 sanity tests — retraction exactness, $J_g \cdot J_H^{\text{pose}} = 0$, metric symmetry/PSD, lift idempotence, log/exp roundtrip, position-only fallback, closed-form vs FD Jacobian. 모두 통과 (numerical floor $\sim 3 \times 10^{-8}$ from pytorch_kinematics non-orthogonality, 그 외 1e-9 ~ 1e-13). |
+| 4 | `smcdp/franka/{ground_truth_pose, self_model_pose}.py` + `franka_stage1_selfmodel_pose.py` | 3-axis 1–3° rotation compliance ($K_R = 0.025$ rad base, axis amp $A_x, A_y, A_z$, tool-len modulation $K_{\text{tool}}^R$) + Stage-1 ξ_φ training script. End-to-end smoke test 작동 (5 step). |
+| 5 | `smcdp/franka/demo_gen_pose.py`, `smcdp/trajectories_pose.py`, `smcdp/experiments/franka_traj_unet_pose.py` | Pose-IK with body-frame twist DLS, bimodal demo (target $R$ axis-angle ~ Uniform[$-30°, +30°$] per axis), `TrajectoryScoreNetUNetPose` (chart output, `goal_cond_dim=14$ for $T_{\text{start}} \oplus T_{\text{target}}$), chart-G pose DSM loss (extension.tex Eq. (35)/(37)), reverse GRW with retraction via $H_\phi^{\text{pose}}$. |
+| 6 | `tests/test_reward_gradient_verification.py` | extension.tex Appendix A.4 protocol implementation. **Resolves the [VERIFY] flag**. |
+
+## VII.2 Reward Gradient Verification Outcome
+
+`tests/test_reward_gradient_verification.py` 결과 (Franka 7-DoF, $\alpha_p^g = \alpha_R^g = 100$, FP64):
+
+```
+[autograd vs FD]   max diff = 8.07e-10  (target < 1e-4)  ✓
+
+[closed-form candidates vs autograd]
+  +_Jl :  rel err = 9.67e-05   ← MATCH
+  -_Jl :  rel err = 2.00e+00
+  +_Jr :  rel err = 3.25e-02
+  -_Jr :  rel err = 2.00e+00
+
+[simplified small-error sweep, +sign]
+   ‖e‖_∞ = 0.015 rad  →  rel err 0.02%
+   ‖e‖_∞ = 0.075 rad  →  rel err 0.11%
+   ‖e‖_∞ = 0.150 rad  →  rel err 0.22%
+   ‖e‖_∞ = 0.301 rad  →  rel err 0.45%
+   ‖e‖_∞ = 0.452 rad  →  rel err 0.67%
+   ‖e‖_∞ = 0.753 rad  →  rel err 1.10%
+   ‖e‖_∞ = 1.204 rad  →  rel err 1.75%
+```
+
+**해결된 closed form**:
+$$
+\nabla_{q_H} R_{\text{goal}} = +2 \, J_{\text{pose}}^\top \, \mathcal{J}_l^{-\top}(e_{\text{goal}}) \, W_g \, e_{\text{goal}}.
+$$
+Sign $= +$, Jacobian $= \mathcal{J}_l$. Simplified form (no $\mathcal{J}$-factor) 는 $+2$ sign으로, $\|e\| \lesssim 0.75$ rad에서 $1\%$ 이하 오차.
+
+**v1 vs v2 차이**: extension.tex v1는 simplified form sign을 $-2$로 표기 — 이는 **WRONG**. v2 본문 + Appendix A 모두 update 완료 (`extension.tex`).
+
+## VII.3 코드베이스 통합 결과
+
+- 기존 position-only 코드 (`smcdp/manifolds.py`, `smcdp/franka/self_model.py`, `smcdp/trajectories.py`)는 **그대로 보존**. pose 확장은 **완전히 분리된 parallel module** (`*_pose.py`)로, 기존 실험 스크립트에 영향 없음.
+- 핵심 design decision: tangent representation은 **trivialized** ($n_q + 6 + n_z$ dim, body-frame se(3))을 채택, point는 storage form ($n_q + 7 + n_z$, quaternion). DSM loss는 chart form (extension.tex Eq. (37))으로 dim-mismatch 회피.
+- vmap-safe primitives: 모든 autograd-critical path (Jacobian, DSM target, reward gradient)는 `(R, p)`-tuple form으로 통일, quaternion roundtrip 회피 (roma의 in-place op이 vmap에서 fail).
+- Hybrid Jacobian (Learned model): $J_{\text{pose}}^{\text{body}} = \mathrm{Ad}_{T_d^{-1}} J_a^{\text{body}} + J_d^{\text{body}}$, analytic FK는 closed-form, residual exp(ξ_φ)는 autograd. FD verification 1e-8 수준 일치.
+
+## VII.4 학습 / Eval 미진행 항목 (server transfer 대기)
+
+GPU-bound 학습은 server에서 rsync로 진행 예정 (사용자 결정):
+- Stage-1 pose self-model: `python -m smcdp.experiments.franka_stage1_selfmodel_pose --steps 10000`
+- V2 pose score-net: `python -m smcdp.experiments.franka_traj_unet_pose --steps 15000`
+- 예상 target (extension.tex Sec 12.2 verification): position $\sim 0.29$ mm, rotation $\sim 1°$ on synthetic compliance (analogous to position-only $55.8\times$ improvement on 14.6 mm → 0.26 mm).
+
+## VII.5 Future Work (extension.tex Sec 11)
+
+- Manipulability-weighted $W(q, z_e) = (J_{\text{pose}} J_{\text{pose}}^\top)^{-1}$: kinematic-singularity-aware metric. 코드 변경 minimal — `_W_diag` 만 q-dependent로.
+- Joint-space inertia $G^{\text{phys}} = M(q) + J^\top W J$: energy-aware sampling.
+- Task ellipsoid $W_p = R_{\text{task}} \mathrm{diag}(\sigma^{-2}) R_{\text{task}}^\top$: anisotropic tolerance.
+- Pose-aware baselines (BC-pose, DP-pose): 현재 position-only baseline만 구현됨; pose target conditioning 추가는 baseline-별 conditioning vector 변경 (e.g. DP의 $\text{cond} \in \mathbb{R}^6 \to \mathbb{R}^{14}$)으로 가능.
