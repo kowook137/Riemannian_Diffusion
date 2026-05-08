@@ -192,8 +192,13 @@ def traj_forward_grw_pose(
 ) -> Tensor:
     """Forward GRW on M_φ^pose(z_e)^{H+1} in chart form, retracting via H_φ^pose.
 
-    Per-substep δq ~ N(0, G_pose^{-1} · Δr · β(r)).  Pose manifold's exp is
-    the graph retraction (q ← q + δq, T_φ recomputed): adherence by construction.
+    Brownian-on-M with diffusion √β (extension.tex Sec. 5):
+        dX_r = √β(r) dB^M_r       (we omit Langevin drift; score net learns the
+                                    drift correction implicitly via DSM)
+    Discretized chart update per substep:
+        δq ~ √(β(r) · Δr) · ξ_q,  ξ_q ~ N(0, G_pose^{-1})
+    so accumulated variance ≈ ∫β(s) ds = τ_brown(r), matching the DSM target's
+    1/τ_brown rescaling.
     """
     manifold = sde.manifold
     schedule = sde.schedule
@@ -205,21 +210,19 @@ def traj_forward_grw_pose(
     z = tau_0[..., n_q + 7:].clone()                                            # (B, H+1, n_z)
 
     # Discretise (0 → r) per sample
-    dr = (r / n_steps).view(B, 1, 1, 1)                                         # (B, 1, 1, 1)
-    for _ in range(n_steps):
-        # Mid-time r' for β coefficient; using start-time is fine for small dr.
-        # We do not include the limiting drift here to mirror the position-only
-        # forward GRW (which assumes the limiting drift is the SDE's own).
-        # (sde.b_fwd is computed by traj_reverse_grw at sample time.)
+    dr = (r / n_steps).view(B, 1, 1)                                            # (B, 1, 1)
+    for k in range(n_steps):
+        # Mid-step time for β coefficient (Stratonovich-ish; OK for small Δr)
+        r_k = (k + 0.5) / n_steps * r                                            # (B,)
+        beta_k = schedule.beta(r_k).view(B, 1, 1)                                # (B, 1, 1)
         L = _per_timestep_G_chol(manifold, q, z)                                # (B, H+1, n_q, n_q)
-        # ξ ~ N(0, G^{-1}) → ξ = L^{-T} z, where L L^T = G ⇒ G^{-1} = L^{-T} L^{-1}
         eps = torch.randn_like(q)
         a = torch.linalg.solve_triangular(
             L.transpose(-1, -2), eps.unsqueeze(-1), upper=True
         ).squeeze(-1)                                                           # (B, H+1, n_q)
-        q = q + (dr.squeeze(-1) ** 0.5) * a
+        # √(β · Δr) · a — matches position-only `traj_forward_grw` convention.
+        q = q + (beta_k * dr).sqrt() * a
 
-    # Re-lift to ambient via H_φ^pose per timestep
     q_flat = q.reshape(B * H1, n_q)
     z_flat = z.reshape(B * H1, n_z)
     x_flat = manifold.make_x(q_flat, z_flat)
@@ -406,6 +409,7 @@ def traj_reverse_grw_pose(
         r_k = r_grid[k]
         r_kp1 = r_grid[k + 1]
         dr = (r_k - r_kp1).abs()                                                # positive
+        beta_k = schedule.beta(r_k.expand(B)).view(B, 1, 1)                     # (B, 1, 1)
 
         # Score (chart, B, H+1, n_q)
         if goal_cond is not None:
@@ -415,9 +419,8 @@ def traj_reverse_grw_pose(
         if score_postprocess is not None:
             s = score_postprocess(s, r_k)
 
-        # Limiting drift in chart: b^q(q) = −(1/2γ²) G^{-1} (q − μ)
-        # Following the position-only convention; full ½ log det G correction
-        # is omitted (matches existing position-only reverse_grw).
+        # Limiting drift (chart): b^q = −(1/2γ²) G^{-1} (q − μ)
+        # ½ log det G correction omitted (matches position-only reverse_grw).
         gamma2 = limiting_scale ** 2
         q_flat = q.reshape(B * H1, n_q)
         L = manifold.G_pose_chol(q_flat, z_flat)
@@ -426,16 +429,17 @@ def traj_reverse_grw_pose(
         b_q_flat = -(0.5 / gamma2) * Ginv_diff
         b_q = b_q_flat.reshape(B, H1, n_q)
 
-        mu_drift = -b_q + s                                                     # reverse-time
+        # Anderson reverse SDE: dY = [-b_fwd + β·score] dr̄ + √β dB^M
+        # (extension.tex Sec. 5; matches position-only `traj_reverse_grw` convention).
+        reverse_drift = -b_q + beta_k * s                                       # (B, H+1, n_q)
 
-        # Tangent noise
+        # Tangent noise ξ_q ~ N(0, G^{-1})
         eps_step = torch.randn(B, H1, n_q, device=device, dtype=dtype)
         a_step = torch.linalg.solve_triangular(
             L.transpose(-1, -2), eps_step.reshape(B * H1, n_q, 1), upper=True,
-        ).squeeze(-1)                                                           # (B*H1, n_q)
-        a_step = a_step.reshape(B, H1, n_q)
+        ).squeeze(-1).reshape(B, H1, n_q)
 
-        delta_q = dr * mu_drift + dr.sqrt() * a_step
+        delta_q = reverse_drift * dr + (beta_k * dr).sqrt() * a_step
         q = q + delta_q
         x = manifold.make_x(q.reshape(B * H1, n_q), z_flat).reshape(B, H1, manifold.ambient_dim)
 
