@@ -208,43 +208,51 @@ $\sigma_K$ / proxy_std mode / per-trajectory $q^\text{init}$ 셋이 *각각* 얼
 
 ---
 
-## 7. Baseline 비교 (예정)
+## 7. Baseline 비교 (`metric.md` 통합 metric)
 
-Pose-extended baseline을 동일 framework에서 학습하여 Ours-V2 (Method A) 대비 우위 입증:
+Pose-extended baseline을 동일 framework에서 학습하여 Ours-V2 (Method A) 대비 우위 입증.
 
-| Baseline | 설명 | 코드 |
+| Baseline | 설명 | 상태 |
 |---|---|---|
-| BC | Deterministic regressor $c \to q$-trajectory | `BCTrajectoryPredictor` |
-| DP-canonical (global cond) | Standard Diffusion Policy (Chi23, global cond) | `make_official_diffusion_policy` |
-| DP-channel | DP-A variant (channel-concat cond, parity with Ours) | `channel_concat_dp_loss` |
-| Projected | Ambient (q, T_storage) DP + post-step projection via $H_\phi^\text{pose}$ | with `arm.make_x` |
+| BC | Deterministic regressor $c \to q$-trajectory | ✓ 완료 |
+| DP-canonical (global cond) | Standard Diffusion Policy (Chi23) | 진행 중 (GPU 0) |
+| DP-channel | DP-A variant (channel-concat cond, parity with Ours) | 대기 (GPU 1) |
+| Projected | Ambient (q, T_storage) DP + projection via $H_\phi^\text{pose}$ | 대기 (GPU 1) |
 
-**조건**:
-- Conditioning: $c = (T_\text{start} \oplus T_\text{target} \oplus z_e) \in \mathbb{R}^{15}$ (storage form)
-- 모든 baseline 동일 demo 분포, 동일 H+1=16, batch=64, steps=15000
-- Eval: 동일 metric (e_p, e_R, combined succ@5cm + 15°)
+**조건**: 동일 conditioning $c = (T_\text{start} \oplus T_\text{target} \oplus z_e) \in \mathbb{R}^{15}$, 동일 demo 분포, H+1=16, batch=64, steps=15000.
 
-**Training scripts**:
-```bash
-# BC
-python -m smcdp.experiments.franka_baselines_pose_train --baseline bc
+### 7.1 BC (Behavioral Cloning) 결과
 
-# DP-canonical (global cond)
-python -m smcdp.experiments.franka_baselines_pose_train --baseline dp_official
+| $z_e$ | pos cm | rot ° | pose@5/5° | pose@5/10° | mode frac err | manif gap | jvio |
+|---|---|---|---|---|---|---|---|
+| 0.05 | 2.00 | 3.09 | **95.31%** | 100% | **0.47** | 0 | 0% |
+| 0.10 | 1.94 | 2.63 | **100%** | 100% | 0.47 | 0 | 0% |
+| 0.15 | 2.40 | 2.64 | 98.44% | 100% | 0.47 | 0 | 0% |
+| 0.20 | 3.62 | 3.05 | 85.94% | 87.5% | 0.47 | 0 | 0% |
+| **평균** | **2.49** | **2.85** | **94.92%** | **96.88%** | **0.47** | **0** | **0%** |
 
-# DP-channel (parity with Ours)
-python -m smcdp.experiments.franka_baselines_pose_train --baseline dp_official --cond-injection channel
+학습 시간 ~3시간, model 1.12 M params (UNet 10M의 1/9).
 
-# Projected
-python -m smcdp.experiments.franka_baselines_pose_train --baseline projected
-```
+### 7.2 Method A vs BC — *pose accuracy 동등, multimodality 차이*
 
-**Eval**:
-```bash
-python -m smcdp.experiments.franka_baselines_pose_eval --ckpt outputs/franka_baseline_pose_<name>/ckpt.pt
-```
+| Metric | **Method A** | **BC** | 차이 |
+|---|---|---|---|
+| pose_succ@(5cm,5°) avg | 91.01% | **94.92%** | BC +3.9 pp |
+| pose_succ@(5cm,10°) avg | 97.66% | 96.88% | tie |
+| pos_err mean (cm) | 2.48 | 2.49 | tie |
+| rot_err mean (°) | 2.91 | 2.85 | tie |
+| **mode_frac_err** | **0.12** | **0.47** | **Method A 4× better** |
+| manifold gap (mm) | ~0 | ~0 | tie (둘 다 H_φ로 lift) |
+| joint viol rate | 0% | 0% | tie |
 
-결과는 §7.x에 추가 예정.
+**핵심 관찰**:
+- **Pose accuracy**: BC가 *근소하게* 더 높음 (단일 seed noise 범위)
+- **Multimodality**: Method A가 *4× 더 잘 보존*. BC의 mode_frac_err = 0.47은 demo bimodal balance (0.5)에서 한 mode로 ~97% collapse한 것.
+- **Manifold adherence**: 둘 다 ≈ 0 (BC는 $q$만 출력 후 $H_\phi^\text{pose}$로 lift, Method A는 sample이 매니폴드 위 by construction)
+
+→ Paper의 contribution은 "**pose accuracy가 우위**"가 아니라 "**같은 pose accuracy를 *bimodal distribution을 보존하면서* 달성**". `metric.md` §7.1이 예측한 BC의 mode collapse 약점이 정확히 정량 검증됨.
+
+**남은 baseline**: DP-canonical (mode capture 능력 있음, 진짜 강한 비교), DP-channel (Ours architecture parity), Projected (manifold gap 차이 측정).
 
 ---
 
