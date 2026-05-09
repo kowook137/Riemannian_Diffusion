@@ -70,7 +70,7 @@ class PoseLangevinSDE:
         manifold: EmbodimentPoseGraphManifold,
         schedule,
         limiting_q_mean: Tensor | None = None,
-        limiting_scale: float = 0.6,
+        limiting_scale: float | None = None,
         forward_langevin_drift: bool = False,
         confining_kappa: float = 0.0,
         confining_epsilon_frac: float = 0.05,
@@ -102,7 +102,15 @@ class PoseLangevinSDE:
             self.limiting_q_mean = torch.as_tensor(limiting_q_mean, dtype=torch.float32)
         else:
             self.limiting_q_mean = None
-        self.limiting_scale = float(limiting_scale)
+        # limiting_scale is the σ_K reverse-init scale; legacy default 0.6, but
+        # Method A leaves it as None and the reverse sampler auto-calibrates to
+        # √τ_brown(K).  When None we still need a fallback for any forward-drift
+        # legacy path; use the auto-calibrated value.
+        if limiting_scale is None:
+            tf_t = torch.tensor(schedule.tf, dtype=torch.float32)
+            self.limiting_scale = float(schedule.integral(tf_t).clamp(min=1e-12).sqrt().item())
+        else:
+            self.limiting_scale = float(limiting_scale)
         self.forward_langevin_drift = bool(forward_langevin_drift)
         self.confining_kappa = float(confining_kappa)
         self.confining_epsilon_frac = float(confining_epsilon_frac)
