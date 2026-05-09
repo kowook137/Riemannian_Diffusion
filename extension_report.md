@@ -143,18 +143,18 @@ spike >1e+3:  51 / 15301 (0.3%, 거의 시작 부분)
 
 교과서적 monotone convergence, ~1000× 하강 over 15000 steps. fix123/κ=10의 1e+9 ~ 1e+13 oscillation과 명확히 다른 trajectory.
 
-### 5.2 Eval (per z_e — tool extension)
+### 5.2 Eval (per z_e — tool extension, `metric.md` 통합 set)
 
-| $z_e$ | pos_err mean | pos_err max | rot_err mean | **succ@5cm + 15°** | manif ‖$g_\phi$‖_max |
+| $z_e$ | pos cm | rot ° | pose@5/5° | pose@5/10° | manif gap |
 |---|---|---|---|---|---|
-| 0.05 m | **2.09 cm** | 4.49 cm | 0.048 rad (2.7°) | **51.6%** | 3.0e-5 |
-| 0.10 m | 2.13 cm | 3.45 cm | 0.049 rad (2.8°) | 40.6% | 3.0e-5 |
-| 0.15 m | 2.72 cm | 5.94 cm | 0.056 rad (3.2°) | 21.9% | 1.1e-4 |
-| 0.20 m | 3.42 cm | 6.90 cm | 0.063 rad (3.6°) | 12.5% | 1.5e-5 |
+| 0.05 m | **2.00** | **2.79°** | **95.31%** | 100% | 0.000 mm / 0.005° |
+| 0.10 m | 2.15 | 2.77° | **95.31%** | 100% | ~0 |
+| 0.15 m | 2.53 | 2.93° | 92.19% | 98.44% | ~0 |
+| 0.20 m | 3.24 | 3.15° | 81.25% | 92.19% | ~0 |
 
-**평균** (4개 z_e): pos_err 2.59 cm, rot_err 3.1°, **succ@5cm 31.6%**.
+**평균** (4개 z_e): pos_err 2.48 cm, rot_err 2.91°, **pose_succ@(5cm,5°) = 91.0%**, manifold gap ≈ 0 (machine precision).
 
-**Pure pose 도달** (z_e=0.05): pos_err **2.09 cm**, rot_err **2.7°**, **succ@5cm 51.6%**.
+**(주의)**: 이전 보고된 "succ 51.6%"는 default `--success-pos 0.02` (2cm) threshold 때문에 *position-strict*로 측정됨. `metric.md` standard pose_succ@(5cm, 5°) 기준으로 재평가 시 **95.3%** (z_e=0.05). 표준 metric으로 재계산이 paper의 정확한 성능 수치.
 
 ### 5.3 Position-only V2 (REPORT Part III)와의 비교
 
@@ -173,29 +173,32 @@ Position 정밀도는 동등 ($\approx$ 2 cm). Rotation을 추가로 맞추는 s
 
 $\sigma_K$ / proxy_std mode / per-trajectory $q^\text{init}$ 셋이 *각각* 얼마나 critical한지 측정. 다른 모든 hyperparameter는 동일.
 
-### 6.1 Ablation 결과 표 (2026-05-10 시점, ABL2 진행 중)
+### 6.1 Ablation 결과 표 (`metric.md` 통합 metric, ABL2 측정 중)
 
-| 설정 | $\sigma_K$ | proxy_std | $q^\text{init}$ | succ@5cm (z_e=0.05) | succ 평균 |
-|---|---|---|---|---|---|
-| **Method A (full)** | calibrated 1.414 | brownian | per-traj | **51.6%** | **31.6%** |
-| ABL1 (σ_K=0.6) | legacy 0.6 | brownian | per-traj | 60.9% | 35.6% |
-| **ABL3 (q_init=μ_q)** | calibrated 1.414 | brownian | **single μ_q** | **7.8%** | **12.5%** |
-| ABL2 (proxy_std=ou) | calibrated 1.414 | **ou** | per-traj | (pending) | (pending) |
+`pose_succ@(5cm, 5°)` 기준 (strict full-pose criterion).
+
+| 설정 | $\sigma_K$ | proxy_std | $q^\text{init}$ | z_e=0.05 | z_e=0.10 | z_e=0.15 | z_e=0.20 | **평균** |
+|---|---|---|---|---|---|---|---|---|
+| **Method A (full)** | 1.414 | brownian | per-traj | **95.31%** | 95.31% | 92.19% | 81.25% | **91.01%** |
+| ABL1 (σ_K=0.6) | 0.6 | brownian | per-traj | 96.88% | 98.44% | 98.44% | 90.62% | 96.10% |
+| **ABL3 (q_init=μ_q)** | 1.414 | brownian | **single μ_q** | **17.19%** | 20.31% | 18.75% | 21.88% | **19.53%** |
+| ABL2 (proxy_std=ou) | 1.414 | **ou** | per-traj | (pending) | (pending) | (pending) | (pending) | (pending) |
 
 ### 6.2 Component-wise contribution
 
-**ABL3 (per-trajectory q_init 제거)** — **−43.8 pp at z_e=0.05** (51.6% → 7.8%):
-- z_e=0.05: 51.6% → 7.8% (6.6× 약화), rot_err 0.048 → 0.165 rad (3.4× 악화)
-- 평균: 31.6% → 12.5% (−19 pp)
-- 통계적으로 명백 (95% CI ±12 pp 초과)
-- → **Per-trajectory $q^\text{init}$이 Method A의 *empirical* core contribution**. 진단의 Q3 (anchor mismatch) 가설 정량 검증.
+**ABL3 (per-trajectory q_init 제거)** — **−78.1 pp at z_e=0.05** (95.31% → 17.19%):
+- 모든 z_e에서 Method A 대비 ~70-80 pp 약화 (평균 91.01% → 19.53%, **−71.5 pp**)
+- rot_err: Method A 2.79° → ABL3 9.95° (3.6× 악화); pos_err 2.00 → 4.39 cm (2.2× 악화)
+- 통계적 매우 견고 (95% CI ±12 pp을 6배 이상 초과)
+- → **Per-trajectory $q^\text{init}$이 Method A의 결정적 core contribution**. 진단의 Q3 (anchor mismatch) 가설 정량 검증.
 
-**ABL1 (σ_K=0.6 legacy)** — **+9 pp at z_e=0.05** (51.6% → 60.9%):
-- 평균 −0~9 pp 차이, 통계적 noise 범위 (95% CI ±12 pp 이내)
-- σ_K calibration은 *spec 정밀화*로서 옳지만 *empirical 효과*는 marginal — robustness signal
-- 실제로 $\sigma_K = 0.6$이 약간 더 잘 나옴: score net의 effective coverage가 forward marginal보다 narrower일 가능성 (training weight 분포)
+**ABL1 (σ_K=0.6 legacy)** — **+1.6 pp at z_e=0.05** (95.31% → 96.88%, 평균 +5 pp):
+- 모든 z_e에서 Method A보다 약간 더 나음
+- 통계적 marginal — 95% CI ±12 pp 이내
+- σ_K calibration은 *spec 정밀화*로 옳지만 *empirical 효과 marginal* — robustness signal
+- Forward marginal과 정합한 σ_K=1.414 vs legacy 0.6이 비슷하거나 약간 더 narrow init이 유리 — score net의 effective coverage 영역과 관련 (paper에서 추가 분석 가능)
 
-**ABL2 (proxy_std = ou)**: 측정 진행 중 (ETA 2시간). proxy_std는 학습 weighting + std_trick에만 영향, sampling init 영향 없음 → ABL1처럼 marginal 차이 예상.
+**ABL2 (proxy_std = ou)**: 측정 진행 중 (ETA ~2h). 학습 weighting + std_trick에만 영향, sampling init 영향 없음 → ABL1처럼 marginal 차이 예상.
 
 ---
 
