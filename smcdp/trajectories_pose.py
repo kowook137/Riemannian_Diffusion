@@ -489,6 +489,7 @@ def traj_dsm_pose_loss(
     goal_cond: Optional[Tensor] = None,
     cond_drop_prob: float = 0.0,
     endpoint_weight: float = 1.0,
+    proxy_std_mode: str = "ou",
 ) -> Tensor:
     """ℒ_pose = E_{r, τ_0, τ_r} [ w(r) · Σ_h (s^q_h − a*_pose,h)^⊤ G_pose,h (s^q_h − a*_pose,h) / τ²_brown ]
 
@@ -553,7 +554,7 @@ def traj_dsm_pose_loss(
         sq_per_traj = sq_per_pt_h.sum(-1)
 
     if weight == "sigma2":
-        w = schedule.proxy_std(r) ** 2
+        w = schedule.proxy_std(r, mode=proxy_std_mode) ** 2
     elif weight == "beta":
         w = schedule.beta(r)
     elif weight == "none":
@@ -692,8 +693,9 @@ def traj_reverse_grw_pose(
     n_steps: int = 200,
     goal_cond: Optional[Tensor] = None,
     z_e: Optional[Tensor] = None,                                               # (B, n_z)
-    limiting_q_mean: Optional[Tensor] = None,                                   # (n_q,)
-    limiting_scale: float = 0.6,
+    limiting_q_mean: Optional[Tensor] = None,                                   # legacy: single μ_q (n_q,)
+    q_init: Optional[Tensor] = None,                                            # Method A: per-traj anchor (B, n_q)
+    limiting_scale: Optional[float] = None,                                     # if None → √τ_brown(K) auto-calibrated
     eps: float = 2e-4,
     device=None, dtype=torch.float32,
     score_postprocess=None,                                                     # optional post-net rescaling
@@ -734,34 +736,51 @@ def traj_reverse_grw_pose(
         raise ValueError(f"z_e batch ({z_e.shape[0]}) ≠ B ({B})")
     z_traj = z_e.unsqueeze(1).expand(B, H1, n_z).contiguous()                   # (B, H+1, n_z)
 
-    if limiting_q_mean is None:
-        mu_q = torch.zeros(n_q, device=device, dtype=dtype)
+    # ---- Anchor selection: Method A (per-traj q_init) vs legacy (single μ_q) ----
+    use_per_traj_anchor = q_init is not None
+    if use_per_traj_anchor:
+        # Method A: q_init is per-batch (B, n_q), broadcast across timesteps.
+        if q_init.shape != (B, n_q):
+            raise ValueError(
+                f"q_init shape {tuple(q_init.shape)} != ({B}, {n_q})"
+            )
+        anchor_q = q_init.to(device=device, dtype=dtype).unsqueeze(1).expand(B, H1, n_q).contiguous()
+        mu_q = None  # not used when per-traj anchor active
     else:
-        mu_q = limiting_q_mean.to(device=device, dtype=dtype)
+        if limiting_q_mean is None:
+            mu_q = torch.zeros(n_q, device=device, dtype=dtype)
+        else:
+            mu_q = limiting_q_mean.to(device=device, dtype=dtype)
+        anchor_q = mu_q.view(1, 1, n_q).expand(B, H1, n_q).contiguous()
+        # Sync SDE's μ_q (legacy drift helpers read from it on the right device/dtype).
+        sde.limiting_q_mean = mu_q
 
-    # Sync the SDE's μ_q to the kwarg so Fix 3 / drift helpers see the right
-    # anchor (the SDE constructor copy may live on CPU at fp32; reverse runs
-    # may use a different device/dtype).
-    sde.limiting_q_mean = mu_q
-    sde.limiting_scale = float(limiting_scale)
+    # ---- σ_K auto-calibration: √τ_brown(K) for Method A drift-free forward ----
+    if limiting_scale is None:
+        tf_t = torch.tensor(schedule.tf, device=device, dtype=dtype)
+        sigma_K = float(schedule.integral(tf_t).clamp(min=1e-12).sqrt().item())
+    else:
+        sigma_K = float(limiting_scale)
+    sde.limiting_scale = sigma_K
 
-    # Initial chart-Gaussian sample
-    mu_q_flat = mu_q.expand(B * H1, n_q)
+    # ---- Initial chart-Gaussian sample at the anchor ----
     z_flat = z_traj.reshape(B * H1, n_z)
-    L_mu = manifold.G_pose_chol(mu_q_flat, z_flat)                              # (B*H1, n_q, n_q)
+    anchor_q_flat = anchor_q.reshape(B * H1, n_q)
+    L_anchor = manifold.G_pose_chol(anchor_q_flat, z_flat)                      # (B*H1, n_q, n_q)
     eps_init = torch.randn(B, H1, n_q, device=device, dtype=dtype)
     a_init = torch.linalg.solve_triangular(
-        L_mu.transpose(-1, -2),
+        L_anchor.transpose(-1, -2),
         eps_init.reshape(B * H1, n_q, 1),
         upper=True,
     ).squeeze(-1)                                                               # (B*H1, n_q)
-    q = mu_q_flat + limiting_scale * a_init
+    q = anchor_q_flat + sigma_K * a_init
     q = q.reshape(B, H1, n_q)
     x = manifold.make_x(q.reshape(B * H1, n_q), z_flat).reshape(B, H1, manifold.ambient_dim)
 
-    # Fix 3 per-batch anchor metric: Ĝ_b = G(μ_q, z_e[b]).
+    # Fix 3 per-batch anchor metric: Ĝ_b = G(μ_q, z_e[b]).  None for Method A
+    # (no anchor metric in pure-Brownian forward).
     anchor_G = (_compute_anchor_G(sde, z_e)                                     # (B, n_q, n_q)
-                if sde.confining_kappa > 0.0 else None)
+                if (sde.confining_kappa > 0.0 and not use_per_traj_anchor) else None)
 
     # Discretise reverse time r: tf → eps
     r_grid = torch.linspace(schedule.tf, eps, n_steps + 1, device=device, dtype=dtype)
@@ -803,30 +822,36 @@ def traj_reverse_grw_pose(
                 alpha_vel=smoothness_alpha_vel, alpha_acc=smoothness_alpha_acc,
             )
 
-        # Limiting drift (chart, extension.tex Eq. (17)):
-        #   Legacy:  b^q = −(1/2γ²) G⁻¹(q − μ)  −  (1/4) G⁻¹ ∇log det G
-        #   Fix 3 :  b^q = −½ G⁻¹ [γ⁻² Ĝ(q − μ)  +  ∇U_box]
-        # Form is selected inside `_anchor_drift_potential_grad` based on
-        # `sde.confining_kappa`.
+        # Limiting drift (chart, Anderson reverse formula).  Method A: when the
+        # forward SDE has NO drift (sde.forward_langevin_drift == False AND
+        # confining_kappa == 0), the reverse drift's b_fwd term is also 0 — only
+        # the score remains.  This restores forward/reverse consistency that the
+        # legacy code path (which always computed an OU-style b_q) silently broke.
         q_flat = q.reshape(B * H1, n_q)
         L = manifold.G_pose_chol(q_flat, z_flat)
-        try:
-            chart_grad_U = _anchor_drift_potential_grad(
-                sde, q, z_traj, anchor_G,
-            )                                                                   # (B, H+1, n_q)
-            Ginv_grad_U = torch.cholesky_solve(
-                chart_grad_U.reshape(B * H1, n_q, 1), L,
-            ).squeeze(-1).reshape(B, H1, n_q)
-            b_q = -0.5 * Ginv_grad_U
-        except RuntimeError:
-            # Fallback: skip the log-det-G correction term (autograd through
-            # pytorch_kinematics has rarely been seen to fail on extreme
-            # configurations).  Keeps the quadratic-anchor part.
-            mu_q_full = mu_q.view(1, 1, n_q)
-            gamma2 = limiting_scale ** 2
-            rhs = (q - mu_q_full).reshape(B * H1, n_q, 1)
-            Ginv_diff = torch.cholesky_solve(rhs, L).squeeze(-1)
-            b_q = -(0.5 / gamma2) * Ginv_diff.reshape(B, H1, n_q)
+        if (not getattr(sde, "forward_langevin_drift", False)) and (sde.confining_kappa == 0.0):
+            # Method A: pure Brownian forward → reverse b_fwd = 0
+            b_q = torch.zeros(B, H1, n_q, device=device, dtype=dtype)
+        else:
+            #   Legacy:  b^q = −(1/2γ²) G⁻¹(q − μ)  −  (1/4) G⁻¹ ∇log det G
+            #   Fix 3 :  b^q = −½ G⁻¹ [γ⁻² Ĝ(q − μ)  +  ∇U_box]
+            try:
+                chart_grad_U = _anchor_drift_potential_grad(
+                    sde, q, z_traj, anchor_G,
+                )                                                               # (B, H+1, n_q)
+                Ginv_grad_U = torch.cholesky_solve(
+                    chart_grad_U.reshape(B * H1, n_q, 1), L,
+                ).squeeze(-1).reshape(B, H1, n_q)
+                b_q = -0.5 * Ginv_grad_U
+            except RuntimeError:
+                if mu_q is None:
+                    b_q = torch.zeros(B, H1, n_q, device=device, dtype=dtype)
+                else:
+                    mu_q_full = mu_q.view(1, 1, n_q)
+                    gamma2 = sigma_K ** 2
+                    rhs = (q - mu_q_full).reshape(B * H1, n_q, 1)
+                    Ginv_diff = torch.cholesky_solve(rhs, L).squeeze(-1)
+                    b_q = -(0.5 / gamma2) * Ginv_diff.reshape(B, H1, n_q)
 
         # Anderson reverse SDE: dY = [-b_fwd + β·score] dr̄ + √β dB^M
         # (extension.tex Sec. 5; matches position-only `traj_reverse_grw` convention).
@@ -850,18 +875,25 @@ class TrajectoryScaledScoreFnPose(nn.Module):
 
     Mirrors `TrajectoryScaledScoreFn` but works in chart space (output
     (B, H+1, n_q)).  No residual_trick (would require a chart-form b_fwd).
+
+    Args:
+        proxy_std_mode: passed to `schedule.proxy_std(t, mode=...)`.  Use
+            ``"brownian"`` (√I) for Method A drift-free forward; ``"ou"`` for
+            legacy VP-SDE convention.
     """
 
-    def __init__(self, net: TrajectoryScoreNetUNetPose, sde, std_trick: bool = True):
+    def __init__(self, net: TrajectoryScoreNetUNetPose, sde, std_trick: bool = True,
+                  proxy_std_mode: str = "ou"):
         super().__init__()
         self.net = net
         self.sde = sde
         self.std_trick = std_trick
+        self.proxy_std_mode = str(proxy_std_mode)
 
     def forward(self, tau: Tensor, t: Tensor, goal_cond: Tensor | None = None) -> Tensor:
         out = self.net(tau, t, goal_cond=goal_cond)
         if self.std_trick:
             B = tau.shape[0]
-            sigma = self.sde.schedule.proxy_std(t).clamp(min=1e-6).view(B, 1, 1)
+            sigma = self.sde.schedule.proxy_std(t, mode=self.proxy_std_mode).clamp(min=1e-6).view(B, 1, 1)
             out = out / sigma
         return out

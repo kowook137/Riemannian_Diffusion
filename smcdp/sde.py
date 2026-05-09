@@ -48,8 +48,21 @@ class LinearBetaSchedule:
         u = (t - self.t0) / (self.tf - self.t0)
         return (self.tf - self.t0) * (self.beta_0 * u + 0.5 * (self.beta_f - self.beta_0) * u ** 2)
 
-    def proxy_std(self, t: Tensor) -> Tensor:
+    def proxy_std(self, t: Tensor, mode: str = "ou") -> Tensor:
+        """Proxy std for std_trick / loss weighting.
+
+        - ``mode="ou"`` (default, backward-compat): √(1 − exp(−I(t))), the
+          stationary OU std for VP-SDE. Correct calibration when forward has
+          a Langevin drift toward an OU stationary.
+        - ``mode="brownian"``: √I(t), the pure-Brownian marginal std (no
+          drift). Correct calibration for Method A (drift OFF), where the
+          forward marginal cov is τ_brown(t)·G^{-1}, so std scale is √τ_brown.
+        """
         I = self.integral(t)
+        if mode == "brownian":
+            return torch.sqrt(I.clamp(min=1e-12))
+        if mode != "ou":
+            raise ValueError(f"unknown proxy_std mode {mode!r}")
         return torch.sqrt(1.0 - torch.exp(-I))
 
 

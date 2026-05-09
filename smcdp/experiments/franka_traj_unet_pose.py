@@ -100,8 +100,20 @@ def parse_args():
     p.add_argument("--weight", type=str, default="sigma2",
                    choices=["sigma2", "beta", "none"])
     p.add_argument("--limiting-mean-q", type=float, nargs=7,
-                   default=[0.0, -0.3, 0.0, -1.7, 0.0, 1.4, 0.0])
-    p.add_argument("--limiting-scale", type=float, default=0.6)
+                   default=[0.0, -0.3, 0.0, -1.7, 0.0, 1.4, 0.0],
+                   help="Legacy single μ_q anchor; ignored when --method-a is set.")
+    p.add_argument("--limiting-scale", type=float, default=None,
+                   help="σ_K for sampling init (=√τ_brown(K)).  None (default) "
+                        "auto-calibrates from the schedule (Method A correct value).")
+    p.add_argument("--method-a", action="store_true",
+                   help="Method A (modificatin.md): pure-Brownian forward, "
+                        "per-trajectory q_init at sampling, brownian-mode "
+                        "proxy_std.  Drift OFF + Fix 1 (σ_p=0.05) baseline.")
+    p.add_argument("--proxy-std-mode", type=str, default=None,
+                   choices=[None, "ou", "brownian"],
+                   help="proxy_std calibration: 'brownian' (√I, Method A) or "
+                        "'ou' (√(1−exp(−I)), legacy VP-SDE).  None auto-selects "
+                        "'brownian' under --method-a, else 'ou'.")
     p.add_argument("--forward-langevin-drift", action="store_true",
                    help="Enable Langevin forward drift -½β G⁻¹∇U "
                         "(extension.tex Eq. 15-17).  Stable when σ_p ≥ 0.05 "
@@ -243,8 +255,17 @@ def main():
     for p in ema_net.parameters():
         p.requires_grad_(False)
 
-    score_fn = TrajectoryScaledScoreFnPose(net, sde, std_trick=True)
-    score_fn_ema = TrajectoryScaledScoreFnPose(ema_net, sde, std_trick=True)
+    # Method A vs legacy proxy_std mode resolution
+    if args.proxy_std_mode is None:
+        proxy_std_mode = "brownian" if args.method_a else "ou"
+    else:
+        proxy_std_mode = args.proxy_std_mode
+    print(f"[Method A={'ON' if args.method_a else 'OFF'}]  proxy_std_mode={proxy_std_mode}")
+
+    score_fn = TrajectoryScaledScoreFnPose(net, sde, std_trick=True,
+                                            proxy_std_mode=proxy_std_mode)
+    score_fn_ema = TrajectoryScaledScoreFnPose(ema_net, sde, std_trick=True,
+                                                proxy_std_mode=proxy_std_mode)
 
     optim = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-6)
     n_params = sum(p.numel() for p in net.parameters())
@@ -273,6 +294,7 @@ def main():
             weight=args.weight, n_grw_steps=args.n_grw_steps,
             goal_cond=goal_cond, cond_drop_prob=args.cond_drop_prob,
             endpoint_weight=args.endpoint_weight,
+            proxy_std_mode=proxy_std_mode,
         )
         optim.zero_grad(set_to_none=True)
         loss.backward()
@@ -318,11 +340,16 @@ def main():
         else:  # "last_quarter"
             goal_h = list(range(3 * H1 // 4, H1))
 
+        # Method A: per-trajectory q_init from demo's q_0 (T_start의 IK-equivalent
+        # since T_start = T_φ(q_demo[0]) by construction).  Legacy: uses single μ_q.
+        q_init_eval = (x_demo[:, 0, :arm.n_q].detach().to(device=device, dtype=dtype)
+                        if args.method_a else None)
         samples = traj_reverse_grw_pose(
             sde, score_fn_ema, n_samples=args.n_eval_per_z, H=args.H,
             n_steps=args.n_sample_steps, goal_cond=goal_cond, z_e=z_e,
             limiting_q_mean=torch.tensor(args.limiting_mean_q),
-            limiting_scale=args.limiting_scale,
+            q_init=q_init_eval,
+            limiting_scale=args.limiting_scale,                                  # None → auto √τ_brown(K)
             eps=args.eps, device=device, dtype=dtype,
             T_start_Rp=T_start_Rp,
             start_alpha_p=args.start_alpha_p, start_alpha_R=args.start_alpha_R,
