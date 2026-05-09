@@ -15,8 +15,14 @@ $$T_\phi(q, z_e) = T_\text{analytic}(q, z_e) \cdot \exp_{\mathrm{SE}(3)}(\xi_\ph
 매니폴드 위 점은 storage form $(q, q_R \in S^3, p \in \mathbb{R}^3, z_e)$, tangent는 trivialized $(v_q, v_\xi \in \mathfrak{se}(3), 0)$. 회전은 quaternion으로 저장하되, 모든 autograd-critical path는 $(R, p)$-tuple form (rotation matrix)로 통일하여 vmap-safe.
 
 **달성한 것** (2026-05-10):
-- **첫 번째 작동하는 pose-extended SMCDP**: succ@5cm 51.6% (z_e=0.05), pos_err 2.09 cm, rot_err 2.7°.
+- **첫 번째 작동하는 pose-extended SMCDP** — Method A baseline:
+  - **pose_succ@(5cm, 5°) = 95.31% (z_e=0.05), 91.0% 평균** (`metric.md` 기준 strict full-pose criterion)
+  - pos_err 2.00 cm, rot_err 2.79° at z_e=0.05
+  - manifold gap ≈ 0 (machine precision, by construction)
 - 이전 시도 (anchor-metric Langevin drift 가정) 모두 실패 (succ 0%, q ~10⁵ rad 폭주). Method A (forward Brownian + condition-aware sampling init)으로 해결.
+- **Per-trajectory $q^\text{init}$이 결정적 contribution**: ABL3 (제거 시) 91% → 19.5% (-71.5 pp) — Q3 anchor mismatch 진단의 정량 검증.
+
+**진행 중** (2026-05-10): ABL2 (proxy_std=ou), pose-baseline 비교 (BC, DP-canonical, DP-channel, Projected) — `metric.md` 통합 metric. 결과 도착 순서대로 §6, §7에 누적 업데이트.
 
 ---
 
@@ -109,7 +115,7 @@ err_analytic_rot_mean: 0.02962 rad →   err_learned_rot_mean: 0.00180 rad (16.4
 | 1 (drift ON, σ_p=0.01) | Cholesky failure | — | — | Step 0 crash |
 | 2 (Fix 1+2+3, κ=1000) | drift ON + 강한 confining | 25–31 **m** | 0% | Loss spike 1e+13 |
 | 3 (κ=10) | drift ON + 약한 confining | 13–16 **m** | 0% | Loss spike 1e+8 다수 |
-| **4 (Method A)** | **drift OFF + condition-aware init** | **2–3 cm** | **12–52%** | clean monotone |
+| **4 (Method A)** | **drift OFF + condition-aware init** | **2.0–3.2 cm** | **81–96%** (5/5°), **92–100%** (5/10°) | clean monotone |
 
 Phase 2/3 진단의 5가지 의심점 (`training_diagnosis_2026-05-09.md` §4):
 - (Q1) drift OFF + pose 미측정 baseline 부재
@@ -161,11 +167,11 @@ spike >1e+3:  51 / 15301 (0.3%, 거의 시작 부분)
 | 항목 | Position-only V2 | Pose-extended Method A |
 |---|---|---|
 | Target dim | $p \in \mathbb{R}^3$ (3-dim) | $T \in \mathrm{SE}(3)$ (6-dim) |
-| pos_err | 21 mm | 21–34 mm (z_e=0.05–0.20) |
-| Success criterion | pos < 5 cm | pos < 5 cm AND rot < 15° |
-| succ rate | ~95% | 13–52% |
+| pos_err | 21 mm | 20–32 mm (z_e=0.05–0.20) |
+| Success criterion | pos < 5 cm | pos < 5 cm AND rot < 5° (`metric.md` strict) |
+| succ rate | ~95% | 81–95% (z_e=0.05–0.20) — **average 91%** |
 
-Position 정밀도는 동등 ($\approx$ 2 cm). Rotation을 추가로 맞추는 stricter criterion으로 succ rate 떨어짐.
+Position 정밀도는 동등 ($\approx$ 2 cm). Rotation을 strict 5°로 추가 measure해도 succ rate 거의 유지 (z_e≤0.10에서 95%) — rotation precision (mean 2.79°)이 5° threshold 안에 안정적으로 들어감이 SE(3) extension의 강점.
 
 ---
 
@@ -246,8 +252,9 @@ python -m smcdp.experiments.franka_baselines_pose_eval --ckpt outputs/franka_bas
 
 ### 8.1 z_e robustness 약화
 
-- z_e=0.20 (longest tool, large lever arm)에서 succ 12.5% — 약함
-- 가능한 원인: tool 길이가 EE pose에 강한 dependency, score net의 z_e conditioning이 이 dependency를 충분히 학습 못함
+- z_e=0.20 (longest tool, large lever arm)에서 pose_succ@(5cm,5°) 81.25% — Method A의 z_e=0.05의 95% 대비 −14 pp
+- relaxed threshold pose_succ@(5cm,10°)는 92.19%로 z_e robustness가 *rotation*에서 더 두드러짐
+- 가능한 원인: tool 길이가 EE pose에 강한 dependency (특히 rotation rate), score net의 z_e conditioning이 이 dependency를 충분히 학습 못함
 - 잠재적 해결: reward guidance (Stage 6'), z_e-conditional weighting, 또는 z_e dimension에 expanded encoding
 
 ### 8.2 Rotation 정밀도
@@ -264,8 +271,8 @@ python -m smcdp.experiments.franka_baselines_pose_eval --ckpt outputs/franka_bas
 ### 8.4 단일 seed eval의 통계적 한계
 
 - $n_\text{eval} = 64$ per z_e → succ rate std error ~6.25%, 95% CI ±12 pp
-- Method A vs ABL1 (9 pp 차이)는 noise 범위
-- Method A vs ABL3 (44 pp 차이)는 명확한 signal
+- Method A vs ABL1 (~5 pp 차이)는 noise 범위
+- Method A vs ABL3 (−71.5 pp 평균 차이)는 매우 견고한 signal (95% CI을 6배 초과)
 - Multi-seed 학습 (5 seeds × 4 ablations) ≈ 76 시간 추가 학습 필요 — 시간 제약으로 단일 seed로 보고
 
 ---
@@ -307,9 +314,9 @@ python -m smcdp.experiments.franka_baselines_pose_eval --ckpt outputs/franka_bas
 
 | # | 의심 | 상태 |
 |---|---|---|
-| Q1 | drift OFF + pose 미측정 | ✓ Method A로 첫 measurement, 작동 확인 (succ 52%) |
+| Q1 | drift OFF + pose 미측정 | ✓ Method A로 첫 measurement, 작동 확인 (pose_succ@(5cm,5°)=91%) |
 | Q2 | anchor approximation 무효 | ✓ Method A에서 anchor 자체 제거로 해소 |
-| **Q3** | **Score net과 SDE의 anchor mismatch** | ✓ **ABL3에서 −43.8 pp로 정량 검증** |
+| **Q3** | **Score net과 SDE의 anchor mismatch** | ✓ **ABL3에서 −71.5 pp 평균 (z_e=0.05에선 −78.1 pp) 로 정량 검증** |
 | Q4.1 | Langevin forward + Varadhan target 비정합 | ✓ drift 제거 시 학습 자체 정상화 (loss 1e+13 → 1e+1) |
 | Q4.7 | σ_K calibration | △ ABL1에서 측정, marginal 차이만 (robustness signal) |
 
