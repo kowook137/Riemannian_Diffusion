@@ -29,6 +29,9 @@ from smcdp.baselines import (
     make_official_diffusion_policy, official_dp_sample,
     channel_concat_dp_sample,
 )
+from smcdp.franka.eval_metrics_pose import (
+    compute_pose_metrics, format_header, format_row,
+)
 
 
 URDF = f"{pybullet_data.getDataPath()}/franka_panda/panda.urdf"
@@ -132,8 +135,7 @@ def main():
     metrics = {"per_z": [], "args": vars(args), "ckpt": str(args.ckpt),
                 "baseline": a["baseline"], "cond_injection": a.get("cond_injection", "-")}
 
-    print(f"\n{'z_e':>6} | {'pos(m)':>10} | {'pos_max':>10} | {'rot(rad)':>9} | "
-          f"{'succ':>6} | {'manif':>10}")
+    print("\n" + format_header())
     for z_val in args.z_list:
         torch.manual_seed(args.seed + 1000)
         # Sample fresh targets from the demo distribution at this z_e
@@ -195,28 +197,14 @@ def main():
                 )
                 q_gen = q_part
 
-        # ---- Endpoint pose error (matches Method A eval) ----
-        x_H = x_gen[:, -1, :]                                       # (n, ambient_dim)
-        q_H, q_R_H, p_H, _ = arm.split_x(x_H)
-        R_H = quat_to_R(q_R_H)
-        R_target_eval, p_target_eval = pose7_to_Rp(T_target)
-        e = log_relative_Rp(R_H, p_H, R_target_eval, p_target_eval) # (n, 6)
-        e_p = e[..., :3].norm(dim=-1)                               # position part
-        e_R = e[..., 3:].norm(dim=-1)                               # rotation part
-        succ = ((e_p < args.success_pos) & (e_R < args.success_rot)).float().mean().item()
-        manif_adh = arm.constraint(x_gen.reshape(-1, arm.ambient_dim)).norm(dim=-1).max().item()
-
-        metrics["per_z"].append({
-            "z_e": z_val,
-            "e_p_mean": e_p.mean().item(),
-            "e_p_max": e_p.max().item(),
-            "e_R_mean": e_R.mean().item(),
-            "e_R_max": e_R.max().item(),
-            "succ_rate": succ,
-            "manif_adh_max": manif_adh,
-        })
-        print(f"{z_val:>6.2f} | {e_p.mean().item():>10.4e} | {e_p.max().item():>10.4e} | "
-              f"{e_R.mean().item():>9.4f} | {succ:>6.2%} | {manif_adh:>10.3e}")
+        # ---- Comprehensive metrics per metric.md ----
+        m = compute_pose_metrics(
+            arm, x_gen, T_target,
+            x_demo=x_demo, sigma_R=a["sigma_R"],
+        )
+        m["z_e"] = z_val
+        metrics["per_z"].append(m)
+        print(format_row(z_val, m))
 
     with open(out_dir / "eval_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
