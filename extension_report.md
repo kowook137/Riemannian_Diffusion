@@ -188,7 +188,7 @@ $\sigma_K$ / proxy_std mode / per-trajectory $q^\text{init}$ 셋이 *각각* 얼
 | **Method A (full)** | 1.414 | brownian | per-traj | **95.31%** | 95.31% | 92.19% | 81.25% | **91.01%** |
 | ABL1 (σ_K=0.6) | 0.6 | brownian | per-traj | 96.88% | 98.44% | 98.44% | 90.62% | 96.10% |
 | **ABL3 (q_init=μ_q)** | 1.414 | brownian | **single μ_q** | **17.19%** | 20.31% | 18.75% | 21.88% | **19.53%** |
-| ABL2 (proxy_std=ou) | 1.414 | **ou** | per-traj | (pending) | (pending) | (pending) | (pending) | (pending) |
+| ABL2 (proxy_std=ou) | 1.414 | **ou** | per-traj | 89.06% | 90.62% | 87.50% | 75.00% | 85.55% |
 
 ### 6.2 Component-wise contribution
 
@@ -204,7 +204,21 @@ $\sigma_K$ / proxy_std mode / per-trajectory $q^\text{init}$ 셋이 *각각* 얼
 - σ_K calibration은 *spec 정밀화*로 옳지만 *empirical 효과 marginal* — robustness signal
 - Forward marginal과 정합한 σ_K=1.414 vs legacy 0.6이 비슷하거나 약간 더 narrow init이 유리 — score net의 effective coverage 영역과 관련 (paper에서 추가 분석 가능)
 
-**ABL2 (proxy_std = ou)**: 측정 진행 중 (ETA ~2h). 학습 weighting + std_trick에만 영향, sampling init 영향 없음 → ABL1처럼 marginal 차이 예상.
+**ABL2 (proxy_std = ou)** — **−5.46 pp 평균** (91.01% → 85.55%):
+- 모든 z_e에서 약간씩 약화 (−6.25 pp at z_e=0.05, −6.25 pp at z_e=0.20)
+- 통계적으로 약하지만 consistent (모든 4개 z_e에서 monotone negative)
+- proxy_std는 학습 시 std_trick scale + loss weight $w(r) = \sigma^2(r)$에 들어감 → drift-free Brownian forward에서 OU std로 normalize 시 큰 r 영역 weight가 saturated → 큰 r에 학습 capacity 부족 → reverse SDE 큰 r 단계에서 score quality 저하
+- → proxy_std calibration 효과는 marginal하지만 **consistent하게 positive** (Brownian이 정합)
+
+### 6.3 Component contribution ranking (`metric.md` strict criterion)
+
+| 순위 | Component | 평균 영향 | 근거 |
+|---|---|---|---|
+| **1** | **Per-trajectory $q^\text{init}$** | **−71.5 pp** | ABL3에서 결정적 collapse (95% → 19%) |
+| 2 | proxy_std = brownian mode | +5.5 pp | ABL2 모든 z_e에서 consistent negative |
+| 3 | σ_K = √τ_brown(K) | −5.1 pp | ABL1에서 약간 더 좋음, robustness signal |
+
+(2,3은 통계적 noise 범위, 1만 명확한 signal)
 
 ---
 
