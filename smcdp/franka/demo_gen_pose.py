@@ -131,6 +131,15 @@ class FrankaBimodalReachingDemoPose:
         branch_A     : (n,) bool
         z_e          : (n, 1)
         T_target/T_start_used : (n, 7) storage form (q_R, p).
+
+        v4.1 chart-aware behavior (joint_limit_extension §10.3):
+            IK produces *physical* q ∈ (q_min, q_max).  When `self.manifold`
+            is a `BoundedChartPoseManifold`, the chart slot of x stores the
+            chart coordinate u = ψ⁻¹(q) (with η-clip safety, init-only per
+            spec §10.3) — NOT q.  The T-block is identical in both cases
+            since T_φ(ψ(u), z) = T_φ(q, z) when u = ψ⁻¹(q).  When manifold is
+            unwrapped (v4) or wraps an IdentityChart, ψ is the identity and
+            the chart slot stores q directly (backward compat).
         """
         H1 = self.H + 1
         rest_A = self.q_rest_A.to(device=device, dtype=dtype)
@@ -195,11 +204,23 @@ class FrankaBimodalReachingDemoPose:
             q_traj_list.append(q_curr)
         q_traj = torch.stack(q_traj_list, dim=1)                                # (n, H+1, 7)
 
-        # 6. Lift to ambient via the (possibly learned) pose manifold
+        # 6. Lift to ambient via the (possibly learned) pose manifold.
+        #
+        # v4.1: when the manifold has a `.chart` attribute (i.e., it is a
+        # BoundedChartPoseManifold), convert the IK-produced physical q to
+        # chart coordinate u = ψ⁻¹(q) before make_x.  The η-clip in psi_inv
+        # (eps=1e-3) guards against IK output sitting exactly at the joint
+        # limit (where atanh diverges); spec §10.3 designates this as
+        # initialization-only safety, not sampling-time enforcement.  Under
+        # v4 (unwrapped or IdentityChart), this is a no-op (ψ⁻¹ = identity).
         z_traj = z_e.unsqueeze(1).expand(n, H1, 1).contiguous()
         q_flat = q_traj.reshape(-1, 7)
         z_flat = z_traj.reshape(-1, 1)
-        x_flat = self.manifold.make_x(q_flat, z_flat)
+        if hasattr(self.manifold, "chart"):
+            chart_slot_flat = self.manifold.chart.psi_inv(q_flat, eps=1e-3)
+        else:
+            chart_slot_flat = q_flat                                          # v4: chart slot IS physical q
+        x_flat = self.manifold.make_x(chart_slot_flat, z_flat)
         x = x_flat.reshape(n, H1, self.manifold.ambient_dim)
 
         # 7. Pack T_target and T_start in storage form (q_R, p)
