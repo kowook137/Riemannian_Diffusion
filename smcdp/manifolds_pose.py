@@ -1,6 +1,7 @@
-"""Pose-extended embodiment graph manifolds (extension.tex v2).
+"""Pose-extended embodiment graph manifolds (extension.tex v2 + joint_limit_extension v4.1).
 
 Reference: extension.tex (Sec. 1–4 for self-model + manifold + metric).
+v4.1 adds: BoundedChartPoseManifold wrapper (joint_limit_extension.tex §3–§5).
 
 State layout (storage form):
     x = (q, q_R, p, z_e) ∈ R^{n_q + 4 + 3 + n_z}
@@ -442,3 +443,265 @@ class Franka7DoFPose(EmbodimentPoseGraphManifold):
         lower = self.q_lower.to(device=q.device, dtype=q.dtype)
         upper = self.q_upper.to(device=q.device, dtype=q.dtype)
         return (q < lower).any(-1) | (q > upper).any(-1)
+
+
+# =====================================================================
+# Joint-limit bounded chart wrapper (joint_limit_extension v4.1)
+# =====================================================================
+
+
+class BoundedChartPoseManifold(EmbodimentPoseGraphManifold):
+    """Bounded-chart wrapper around an EmbodimentPoseGraphManifold (v4.1 §3–§5).
+
+    Operates in a u-chart `u ∈ R^{n_q}` with a smooth diffeomorphism
+    `q = ψ(u) ∈ (q_min, q_max)` (e.g., element-wise tanh).  All chart-level
+    operations accept and return u (not q); the underlying physical manifold is
+    accessed transparently via ψ.
+
+    Storage layout (chart slot stores u, T-block stores T_φ(ψ(u))):
+        x = (u, q_R, p, z_e) ∈ R^{n_q + 4 + 3 + n_z}
+    Same shape as v4 (`EmbodimentPoseGraphManifold`); only the chart slot
+    interpretation differs.  Use `physical_q(x)` to recover q = ψ(u) when
+    needed.
+
+    Choice A semantics (v4.1 §4 default):
+        J^Q(u, z_e) = J_pose(ψ(u), z_e) · D_ψ(u)        (pulled-back Jacobian)
+        J_H^{Q,A}   = [I_{n_q} ; J^Q]                    (tangent map)
+        G_Q^A       = I_{n_q} + (J^Q)^T W J^Q ≽ I        (lower-bounded by identity)
+        Retr^Q_{(u,T)}(δu) = (u + δu, T_φ(ψ(u + δu), z_e))
+        ψ auto-enforces q ∈ (q_min, q_max); no clipping during sampling.
+
+    Backward compatibility:
+        Pass an `IdentityChart` (ψ(u) = u, D_ψ = I) to recover the v4 unbounded
+        formulation exactly — every method reduces to its base-class form.
+
+    Parameters
+    ----------
+    base_manifold
+        Concrete `EmbodimentPoseGraphManifold` subclass providing
+        `T_phi_Rp(q, z) -> (R, p)` and (optionally) a closed-form
+        `jacobian_pose(q, z) -> J ∈ R^{6×n_q}`.
+    chart
+        `Chart` instance (e.g., `TanhBoundedChart` or `IdentityChart` from
+        `smcdp.charts`) with `psi(u)`, `psi_inv(q, eps)`, `D_psi_diag(u)`.
+    lambda_floor
+        Tikhonov floor `λ_floor` for the regularized G_Q^A (v4.1 §5.1).
+        Default 1e-4; the floor is structurally less critical under Choice A
+        (since G_Q^A ≽ I globally) but retained for arithmetic underflow
+        safety.
+
+    Notes
+    -----
+    Inherits `_W_diag`, `split_x` (returns first slot as u, not q), `make_x`,
+    `H`, `split_v`, `lift_chart_to_tangent`, `exp`, `log`, `proj_to_tangent`,
+    `random_normal_tangent`, `squared_norm`, `belongs`, `constraint`, and
+    `T_phi_storage` from the parent.  These automatically inherit chart-aware
+    semantics because they call `self.jacobian_pose`, `self.G_pose`,
+    `self.T_phi_Rp` (all overridden below).
+    """
+
+    def __init__(
+        self,
+        base_manifold: "EmbodimentPoseGraphManifold",
+        chart,                                                  # smcdp.charts.Chart
+        *,
+        lambda_floor: float = 1e-4,
+    ):
+        if base_manifold.n_q != chart.n_q:
+            raise ValueError(
+                f"chart.n_q ({chart.n_q}) != base_manifold.n_q ({base_manifold.n_q})"
+            )
+        # Parent __init__ initializes n_q, n_z, sigma_p, sigma_R, W_p, W_R,
+        # metric, tikhonov_frac.  We mirror the base_manifold's settings so
+        # downstream code reads the right values via self.{attr}.
+        super().__init__(
+            n_q=base_manifold.n_q,
+            n_z=base_manifold.n_z,
+            sigma_p=base_manifold.sigma_p,
+            sigma_R=base_manifold.sigma_R,
+            metric=base_manifold.metric,
+            tikhonov_frac=base_manifold.tikhonov_frac,
+        )
+        self.base = base_manifold
+        self.chart = chart
+        # v4.1 §5.1: λ_floor — additive floor on the adaptive Tikhonov term.
+        self.lambda_floor = float(lambda_floor)
+
+    # ---------------- chart-aware overrides (v4.1 §3–§5) ----------------
+
+    def physical_q(self, x: Tensor) -> Tensor:
+        """Extract physical joint configuration q = ψ(u) from ambient state.
+
+        Storage layout has u (not q) in the chart slot.  Use this when joint
+        limits, kinematics validity, or the physical interpretation of q is
+        needed downstream.
+        """
+        u = x[..., : self.n_q]
+        return self.chart.psi(u)
+
+    def T_phi_Rp(self, u: Tensor, z: Tensor) -> tuple[Tensor, Tensor]:
+        """T_φ(ψ(u), z_e) → (R, p).  Wraps base.T_phi_Rp via ψ.
+
+        Spec v4.1 §1: the self-model T_φ is a function of physical q; we
+        compose with the chart map ψ here.
+        """
+        q = self.chart.psi(u)
+        return self.base.T_phi_Rp(q, z)
+
+    # T_phi_storage inherited from parent — calls our T_phi_Rp + Rp_to_pose7.
+
+    def jacobian_pose(self, u: Tensor, z: Tensor) -> Tensor:
+        """Pulled-back body-frame Jacobian J^Q(u, z_e) ∈ R^{... × 6 × n_q}.
+
+        Spec v4.1 §4:  J^Q(u, z_e) = J_pose(ψ(u), z_e) · D_ψ(u).
+        Right-multiplication by the diagonal D_ψ scales each column j of
+        J_pose by (q_range_j / 2) · sech²(u_j).  At u → ∞ (chart boundary),
+        D_ψ → 0 and J^Q → 0 element-wise; this is the geometric source of
+        the boundary degeneracy that Choice A's identity floor in G_Q^A
+        protects against (G_Q^A → I, not 0).
+        """
+        q = self.chart.psi(u)
+        J = self.base.jacobian_pose(q, z)                   # (..., 6, n_q)
+        D_diag = self.chart.D_psi_diag(u)                    # (..., n_q)
+        # Right-multiply by diag(D_ψ): scale column j by D_ψ[..., j].
+        # (J · diag(D))[i, j] = J[i, j] · D[j].
+        return J * D_diag.unsqueeze(-2)
+
+    def G_pose(self, u: Tensor, z: Tensor) -> Tensor:
+        """Choice A induced metric G_Q^A(u, z_e) ∈ R^{n_q × n_q} (v4.1 §5).
+
+            G_Q^A = I_{n_q} + (J^Q)^T W J^Q
+                  = I_{n_q} + D_ψ^T J_pose^T W J_pose D_ψ.
+
+        Lower-bounded by I_{n_q} globally because the identity term is
+        independent of D_ψ.  At chart boundary D_ψ → 0 → G_Q^A → I (well-
+        conditioned, not degenerate).  Same shape as base's G_pose.
+        """
+        Jq = self.jacobian_pose(u, z)                        # (..., 6, n_q) — already J^Q
+        W = self._W_diag(u).unsqueeze(-1)                    # (6, 1)
+        eye = torch.eye(self.n_q, device=u.device, dtype=u.dtype)
+        return eye + Jq.transpose(-1, -2) @ (W * Jq)
+
+    def G_pose_chol(
+        self,
+        u: Tensor,
+        z: Tensor,
+        jitter: float = 1e-4,
+        tikhonov_frac: float | None = None,
+        lambda_floor: float | None = None,
+    ) -> Tensor:
+        """Cholesky of G_Q^{A,reg} with adaptive Tikhonov + floor (v4.1 §5.1).
+
+            G_Q^{A,reg}(u, z_e) = G_Q^A(u, z_e) + λ_Q(u, z_e) · I_{n_q}
+            λ_Q(u, z_e)         = c_λ · tr(G_Q^A) / n_q + λ_floor
+
+        Under Choice A the floor is structurally less critical (since
+        G_Q^A ≽ I), but retained for arithmetic underflow safety.  Falls back
+        to the parent's jitter-retry on rare Cholesky failures.
+        """
+        if tikhonov_frac is None:
+            tikhonov_frac = self.tikhonov_frac
+        if lambda_floor is None:
+            lambda_floor = self.lambda_floor
+        G = self.G_pose(u, z)
+        eye = torch.eye(self.n_q, device=u.device, dtype=u.dtype)
+        if tikhonov_frac > 0.0 or lambda_floor > 0.0:
+            tr_G = torch.diagonal(G, dim1=-2, dim2=-1).sum(-1)         # (...,)
+            lam = (tikhonov_frac * tr_G / self.n_q + lambda_floor)
+            lam = lam.unsqueeze(-1).unsqueeze(-1)
+            G = G + lam * eye
+        for j in (jitter, jitter * 10.0, jitter * 100.0):
+            try:
+                return torch.linalg.cholesky(G + j * eye)
+            except torch._C._LinAlgError:
+                continue
+        return torch.linalg.cholesky(G + (jitter * 1000.0) * eye)
+
+    # ---------------- limits / sanity (v4.1 §13) ----------------
+
+    def joint_limits(self, device=None, dtype=None) -> tuple[Tensor, Tensor]:
+        """(q_min, q_max) — physical joint limits inherited from chart."""
+        return self.chart.joint_limits(device=device, dtype=dtype)
+
+    def violates_limits(self, u: Tensor) -> Tensor:
+        """For TanhBoundedChart, this is False at any finite u by construction
+        (v4.1 §13: viol(τ) = 0 by construction).  We compute ψ(u) and check
+        against the base manifold's URDF limits as a sanity check; if this
+        ever returns True, it indicates a numerical issue (e.g., u became
+        non-finite).
+        """
+        q = self.chart.psi(u)
+        if hasattr(self.base, "violates_limits"):
+            return self.base.violates_limits(q)
+        # Fallback: use chart limits directly
+        q_lo, q_hi = self.chart.joint_limits(device=q.device, dtype=q.dtype)
+        return (q < q_lo).any(-1) | (q > q_hi).any(-1)
+
+    # ---------------- sampling utilities ----------------
+
+    def random_uniform(self, n: int, device=None, dtype=torch.float32) -> Tensor:
+        """Uniform sample on M_φ^Q.
+
+        Strategy: sample q uniformly via the base manifold (which knows the
+        URDF margin convention), then convert q → u via ψ⁻¹ with η-clip
+        safety (init-only, v4.1 §10.3).  T-block (= T_φ(q) = T_φ(ψ(u))) and
+        z-block are inherited unchanged.
+        """
+        if not hasattr(self.base, "random_uniform"):
+            raise NotImplementedError(
+                f"BoundedChartPoseManifold.random_uniform requires base.random_uniform; "
+                f"base = {type(self.base).__name__}"
+            )
+        x_base = self.base.random_uniform(n, device=device, dtype=dtype)
+        q_unif = x_base[..., : self.n_q]
+        u_unif = self.chart.psi_inv(q_unif, eps=1e-3)
+        # Replace chart slot only; T-block + z-block are already T_φ(q), z.
+        return torch.cat([u_unif, x_base[..., self.n_q:]], dim=-1)
+
+    # ---------------- delegation for backbone-specific attrs ----------------
+
+    def _ensure_chain(self, like: Tensor) -> None:
+        """Delegate chain device/dtype migration to base (Franka-specific)."""
+        if hasattr(self.base, "_ensure_chain"):
+            self.base._ensure_chain(like)
+
+    def __getattr__(self, name: str):
+        """Fallback: delegate unknown attributes to base manifold.
+
+        Only triggered when standard attribute lookup fails (i.e., the wrapper
+        does not define `name` directly).  Allows downstream code that reads
+        e.g. `arm.urdf_path` or `arm.tool_z_max` to work transparently when
+        wrapping a Franka7DoFPose.
+
+        Caveat: setting attributes on the wrapper still hits the wrapper's
+        __dict__ (Python doesn't route __setattr__ through __getattr__), so
+        e.g. `arm.tikhonov_frac = ...` updates the wrapper, not the base.
+        Mirror sets explicitly if both layers must stay in sync.
+        """
+        # Avoid recursion: __getattr__ is only called when the attr isn't
+        # found normally.  Forward to base's __getattribute__.
+        if name in ("base", "chart", "lambda_floor"):
+            raise AttributeError(name)
+        try:
+            return getattr(self.__dict__["base"], name)
+        except KeyError:
+            raise AttributeError(name)
+
+
+# Convenience factory --------------------------------------------------------
+
+
+def wrap_with_bounded_chart(
+    base_manifold: "EmbodimentPoseGraphManifold",
+    *,
+    lambda_floor: float = 1e-4,
+) -> "BoundedChartPoseManifold":
+    """Convenience factory: wrap a base manifold with a TanhBoundedChart whose
+    limits come from the manifold itself.  Equivalent to::
+
+        chart = make_chart_from_manifold(base, bounded=True, ...)
+        wrapped = BoundedChartPoseManifold(base, chart, lambda_floor=lambda_floor)
+    """
+    from smcdp.charts import make_chart_from_manifold
+    chart = make_chart_from_manifold(base_manifold, bounded=True)
+    return BoundedChartPoseManifold(base_manifold, chart, lambda_floor=lambda_floor)
