@@ -2285,16 +2285,164 @@ Sign $= +$, Jacobian $= \mathcal{J}_l$. Simplified form (no $\mathcal{J}$-factor
 - vmap-safe primitives: 모든 autograd-critical path (Jacobian, DSM target, reward gradient)는 `(R, p)`-tuple form으로 통일, quaternion roundtrip 회피 (roma의 in-place op이 vmap에서 fail).
 - Hybrid Jacobian (Learned model): $J_{\text{pose}}^{\text{body}} = \mathrm{Ad}_{T_d^{-1}} J_a^{\text{body}} + J_d^{\text{body}}$, analytic FK는 closed-form, residual exp(ξ_φ)는 autograd. FD verification 1e-8 수준 일치.
 
-## VII.4 학습 / Eval 미진행 항목 (server transfer 대기)
+## VII.4 학습 / Eval — Stage 1 결과
 
-GPU-bound 학습은 server에서 rsync로 진행 예정 (사용자 결정):
-- Stage-1 pose self-model: `python -m smcdp.experiments.franka_stage1_selfmodel_pose --steps 10000`
-- V2 pose score-net: `python -m smcdp.experiments.franka_traj_unet_pose --steps 15000`
-- 예상 target (extension.tex Sec 12.2 verification): position $\sim 0.29$ mm, rotation $\sim 1°$ on synthetic compliance (analogous to position-only $55.8\times$ improvement on 14.6 mm → 0.26 mm).
+서버 (RTX PRO 6000, 96 GB) docker `kowook` + conda `rdp` 환경에서 진행. 기존 framework 그대로 사용.
 
-## VII.5 Future Work (extension.tex Sec 11)
+**Stage-1 (pose self-model $\xi_\phi$)**: `franka_stage1_selfmodel_pose --steps 10000`
 
-- Manipulability-weighted $W(q, z_e) = (J_{\text{pose}} J_{\text{pose}}^\top)^{-1}$: kinematic-singularity-aware metric. 코드 변경 minimal — `_W_diag` 만 q-dependent로.
-- Joint-space inertia $G^{\text{phys}} = M(q) + J^\top W J$: energy-aware sampling.
-- Task ellipsoid $W_p = R_{\text{task}} \mathrm{diag}(\sigma^{-2}) R_{\text{task}}^\top$: anisotropic tolerance.
-- Pose-aware baselines (BC-pose, DP-pose): 현재 position-only baseline만 구현됨; pose target conditioning 추가는 baseline-별 conditioning vector 변경 (e.g. DP의 $\text{cond} \in \mathbb{R}^6 \to \mathbb{R}^{14}$)으로 가능.
+```
+err_analytic_pos_mean: 0.01605 m   →   err_learned_pos_mean: 0.00342 m
+err_analytic_rot_mean: 0.02962 rad →   err_learned_rot_mean: 0.00180 rad
+improvement_pos: 4.69×              improvement_rot: 16.43×
+```
+
+Position-only baseline (Part III)의 $55.8\times$와 비교 시 작지만, **rotation도 동시에 학습**하는 task로 4.7× pos / 16.4× rot은 합리적. ξ_φ residual smooth (training inside ‖ξ‖=0.053, outside-1x ‖ξ‖=0.066) — extrapolation 안정.
+
+## VII.5 Stage-2 학습 — Method A baseline 도달까지의 iterative debugging
+
+Stage-2 (V2 pose score-net) 학습은 **세 차례 시도**가 필요했음 (자세한 진단: `training_diagnosis_2026-05-09.md`).
+
+### VII.5.1 Phase 1 — Forward Langevin drift 활성화 시도 → Cholesky 실패
+
+Initial config (σ_p = 0.01, drift ON): `cond(G_pose) ~ 10⁵`, fp32 precision으로 일부 demo q에서 G non-PD → 학습 step 0에서 즉시 crash.
+
+→ `forward_langevin_drift = False` (default OFF)로 회피, σ_p relaxation 등 fix 도입 결정.
+
+### VII.5.2 Phase 2 — Fix 1 + 2 + 3 (κ=1000) → catastrophic divergence
+
+`noise_stationary_fix.md` 도입: σ_p 0.01 → 0.05 (Fix 1), adaptive Tikhonov c=1e-2 (Fix 2), anchor-metric soft confining U_total = ½γ⁻²(q-μ)^T Ĝ(q-μ) + κ U_box with κ=1e3 (Fix 3).
+
+```
+Loss range:        1e+8 ~ 1e+13 (oscillation 내내, 수렴 불가)
+Final eval pos_err: 25–31 m         (Franka workspace ~0.85 m)
+Final eval succ@5cm: 0%             (모든 z_e)
+sampled q:          ±10⁵ rad        (Franka [-3.14, +3.82] 의 30,000× 밖)
+manifold ‖g‖:       1e-4 (정상)     ← 수학적 정합 유지
+```
+
+진단: κ=1e3의 box potential drift step이 한 substep당 ~60 rad (joint range의 10배). Cascade 폭주.
+
+### VII.5.3 Phase 3 — κ=10 (100× 축소) → 부분 개선이지만 succ 0%
+
+```
+Loss range:        1e+5 ~ 1e+8     (안정성 개선, but 수렴 부족)
+Final eval pos_err: 13–16 m         (50% 개선이지만 도달 불가)
+Final eval succ@5cm: 0%
+sampled q:          ±10⁴ rad        (여전히 1000× 밖)
+```
+
+→ κ tuning은 *증상* 약화. *Root cause*는 다른 곳.
+
+### VII.5.4 진단 — 5가지 의심점 정량 검증
+
+`training_diagnosis_2026-05-09.md` 분석으로 발견:
+
+| 의심 | 정량 측정 | 검증 |
+|---|---|---|
+| **Q1**: drift OFF + pose 측정 부재 | git log + outputs/ 검사 | 한 번도 측정된 적 없음 |
+| **Q2**: anchor approximation 무효 | $\|q_\text{demo} - \mu_q\|_{\hat G} / \gamma$ 측정 | demo는 stationary 기댓값의 **5.4×** outlier |
+| **Q3**: Score net과 SDE의 anchor mismatch | 코드 trace | score net은 $T_\text{start}$만 받고 $\mu_q$를 모름 |
+| **Q4.1**: Langevin forward + Varadhan target 불일치 | extension.tex Eq. 35 | drift ON 시 target $\propto \text{Log}/\tau_\text{brown}$ 근사 무효 |
+| **Q4.7**: $\sigma_K$ calibration | $\sqrt{\tau_\text{brown}(K)} \approx 1.41$ vs hardcoded $0.6$ | **2.36× mismatch** (sampling-marginal) |
+
+→ **Method A** (`modificatin.md`): drift 완전 제거, σ_K = √τ_brown(K)로 자동 calibration, per-traj q_init at sampling, brownian-mode proxy_std. 5개 의심을 한 번에 해결.
+
+## VII.6 Stage-2 학습 — Method A 결과 ⭐
+
+`franka_traj_unet_pose --method-a --sigma-p 0.05 --tikhonov-frac 1e-2 --steps 15000 --batch 64`. 학습 시간 3시간 49분.
+
+### VII.6.1 학습 trajectory
+
+```
+step    0:  loss = 5.19e+3
+step  330:  loss = 81.67           (5분 시점)
+step 1768:  loss = 13.23           (30분 시점)
+step 7500:  loss = 7.31
+step 11250: loss = 3.76            (bottom 부근)
+step 15000: loss = 5.34            (final)
+
+recent 5%:  min 3.33, median 4.81, max 6.01
+spikes >1e+5:  0건
+spikes >1e+3:  51 / 15301  (0.3%, 거의 시작 부분)
+```
+
+교과서적 monotone convergence + 4-5 plateau 안착. fix123/κ=10의 1e+9 ~ 1e+13 oscillation과 명확히 다른 trajectory.
+
+### VII.6.2 Eval (per z_e — tool extension)
+
+| $z_e$ (m) | pos_err mean | pos_err max | rot_err mean | **succ@5cm** | manifold ‖$g_\phi$‖_max |
+|---|---|---|---|---|---|
+| 0.05 | **2.09 cm** | 4.49 cm | 0.048 rad (2.7°) | **51.6%** | 3.0e-5 |
+| 0.10 | 2.13 cm | 3.45 cm | 0.049 rad (2.8°) | **40.6%** | 3.0e-5 |
+| 0.15 | 2.72 cm | 5.94 cm | 0.056 rad (3.2°) | 21.9% | 1.1e-4 |
+| 0.20 | 3.42 cm | 6.90 cm | 0.063 rad (3.6°) | 12.5% | 1.5e-5 |
+| **평균** | **2.59 cm** | — | **3.1°** | **31.6%** | — |
+
+**Pure pose 도달 (z_e=0.05, shortest tool)**: pos_err 2.09 cm, rot_err 2.7°, **succ@5cm 51.6%**.
+
+### VII.6.3 모든 시도 비교
+
+| Phase | 설정 | pos_err mean | succ@5cm | 학습 안정성 |
+|---|---|---|---|---|
+| Phase 2 (fix123, κ=1e3) | drift ON + Fix 3 강 | 25–31 **m** | 0% | spike 1e+13 |
+| Phase 3 (κ=10) | drift ON + Fix 3 약 | 13–16 **m** | 0% | spike 1e+8 다수 |
+| **Phase 4 (Method A)** | **drift OFF + σ_K calibrated** | **2–3 cm** | **12–52%** | clean monotone |
+
+pos_err 1000–1500× 개선, succ 0% → 52%.
+
+### VII.6.4 학습 요약
+
+| 항목 | 평가 |
+|---|---|
+| Pose-extended SMCDP framework 작동 | ✓ **사상 처음 확인** |
+| Manifold adherence | ✓ ‖$g_\phi$‖ ~ 1e-5 (machine precision) |
+| 학습 안정성 | ✓ Spike 0건, monotone convergence |
+| Position 정밀도 | ✓ 2–3 cm (Franka workspace 0.85 m 기준 충분) |
+| Rotation 정밀도 | △ 2.7–3.6° |
+| z_e robustness | ⚠ tool 길수록 succ 단조 감소 (52% → 12%) |
+
+### VII.6.5 Position-only V2 (Part III, 21 mm) 와의 비교
+
+같은 framework 구조를 *6-DoF SE(3) constraint*로 확장하면서 발생한 task 난이도 증가:
+
+| 항목 | Position-only V2 | Pose-extended Method A |
+|---|---|---|
+| Target dim | $p \in \mathbb{R}^3$ (3-dim) | $T \in \mathrm{SE}(3)$ (6-dim) |
+| pos_err | 21 mm | 21–34 mm (z_e=0.05–0.20) |
+| succ@5cm | ~95% | 13–52% |
+
+Position component만 보면 *동등한 정밀도*. Rotation을 추가로 맞추면서 strict succ 기준이 떨어진 것.
+
+## VII.7 Method A 핵심 design 요약 (`modificatin.md`)
+
+기존 V2의 forward Langevin drift + anchor-metric stationary 가정을 모두 제거. 핵심 spec:
+
+$$
+\begin{aligned}
+\text{Forward SDE:} &\quad dq_r = \sqrt{\beta(r)}\,\sigma(q_r)\,dW_r, \quad \sigma\sigma^\top = G^{-1} \\
+\text{Effective time:} &\quad \tau_\text{brown}(r) := \int_0^r \beta(s)\,ds \\
+\text{Marginal std:} &\quad \sigma_\text{marg}(r) := \sqrt{\tau_\text{brown}(r)} \\
+\text{Sampling init:} &\quad q_K \sim \mathcal{N}(q_0^\text{ref},\, \sigma_\text{marg}(K)^2 \cdot G^{-1}(q_0^\text{ref})) \\
+\text{DSM target:} &\quad a^*_\text{pose} = G^{-1} J_H^{\text{pose}\top} W \delta x^\text{amb}_{r0} \quad \text{(Varadhan, drift-free 정합)}
+\end{aligned}
+$$
+
+**제거된 component**: anchor $\mu_q$ (single point), anchor metric $\hat G = G(\mu_q)$, box potential $U_\text{box}$, 모든 confining drift, OU stationary 가정 (`proxy_std = \sqrt{1-e^{-I}}` legacy).
+
+**유지된 component**: Riemannian metric $G_\text{pose}$, retraction $H_\phi^\text{pose}$, tangent lift $J_H$, multi-component reward guidance ($R_\text{start}, R_\text{goal}, R_\text{vel}, R_\text{acc}$), Adaptive Tikhonov $\lambda(q) = c_\lambda \cdot \mathrm{tr}(G)/n_q$, σ_p = 0.05.
+
+**Limitation framing**: Joint chart $\mathbb{R}^{n_q}$이 non-compact이므로 pure Brownian forward는 stationary 분포 부재. Finite-time noising으로 $r \in [0, K]$ horizon에서 score matching이 valid. Drift-consistent transition score targets (e.g. closed-form OU on Riemannian)는 future work.
+
+## VII.8 Future Work (extension.tex Sec 11 + Method A의 잔존 약점)
+
+기존 [extension.tex Sec 11] 항목 + Method A 측정으로 새로 발견된 약점:
+
+- **z_e robustness 보강**: 현재 z_e=0.20에서 succ 12.5% — tool length lever arm 영향. Reward guidance (Stage 6') 활용 또는 score net의 z_e conditioning 강화 (현재 channel-concat) 필요.
+- **Rotation 정밀도**: 평균 3.1°, 일부 task엔 부족. $W_R$ tuning 또는 SO(3)-aware loss weighting.
+- **Ablation studies**: σ_K calibration / proxy_std mode / per-traj q_init 셋이 *각각* 얼마나 critical인지 isolation 측정 — paper validation에 필요. (서버에서 σ_K=0.6 ablation 진행 중 보고서 작성 시점.)
+- **Manipulability-weighted $W(q, z_e) = (J_\text{pose} J_\text{pose}^\top)^{-1}$**: kinematic-singularity-aware metric. 코드 변경 minimal.
+- **Joint-space inertia $G^\text{phys} = M(q) + J^\top W J$**: energy-aware sampling.
+- **Task ellipsoid $W_p = R_\text{task} \mathrm{diag}(\sigma^{-2}) R_\text{task}^\top$**: anisotropic tolerance.
+- **Pose-aware baselines (BC-pose, DP-pose)**: 현재 position-only baseline만 구현됨; pose target conditioning 추가는 baseline-별 conditioning vector 변경 (e.g. DP의 cond $\in \mathbb{R}^6 \to \mathbb{R}^{14}$)으로 가능.
+

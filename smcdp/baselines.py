@@ -366,14 +366,16 @@ def make_official_diffusion_policy(
     n_train_timesteps: int = 100,
     beta_schedule: str = "squaredcos_cap_v2",
     prediction_type: str = "epsilon",
-    clip_sample: bool = True,
+    clip_sample: bool = False,
     cond_predict_scale: bool = False,
 ):
     """Build the canonical [Chi23] DDPM policy: ConditionalUnet1D + DDPMScheduler.
 
-    Defaults match the published config (`squaredcos_cap_v2` β-schedule, ε-pred,
-    clipped sample).  `down_dims` is reduced from [256,512,1024] to a smaller
-    stack that's appropriate for the toy-scope joint-action dimensionality.
+    `clip_sample` defaults to False because joint-space q values exceed [-1, 1]
+    (e.g. Franka q[3] ≈ -2.16, q[5] ≈ +1.82).  The published [Chi23] config
+    normalizes data to [-1, 1] then uses `clip_sample=True`; we skip that
+    normalization for parity with Ours-V2 (which works in raw q-space) and
+    use `clip_sample=False` for equivalent behavior.
     """
     if not _HAS_OFFICIAL_DP:
         raise RuntimeError(

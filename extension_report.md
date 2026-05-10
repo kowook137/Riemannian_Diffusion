@@ -16,13 +16,43 @@ $$T_\phi(q, z_e) = T_\text{analytic}(q, z_e) \cdot \exp_{\mathrm{SE}(3)}(\xi_\ph
 
 **달성한 것** (2026-05-10):
 - **첫 번째 작동하는 pose-extended SMCDP** — Method A baseline:
-  - **pose_succ@(5cm, 5°) = 95.31% (z_e=0.05), 91.0% 평균** (`metric.md` 기준 strict full-pose criterion)
-  - pos_err 2.00 cm, rot_err 2.79° at z_e=0.05
+  - Training: $z_e \sim \mathrm{Uniform}[0.05, 0.15]$, Eval: ID = {0.05, 0.10, 0.15}, OOD = 0.20 (+33% extrapolation)
+  - **pose_succ@(5cm, 5°) ID 평균 = 94.27%** (z_e=0.05/0.10/0.15에서 92–95%), **OOD = 81.25%** (`metric.md` strict full-pose criterion)
+  - pos_err 2.00 cm, rot_err 2.79° at z_e=0.05 (ID-boundary)
   - manifold gap ≈ 0 (machine precision, by construction)
 - 이전 시도 (anchor-metric Langevin drift 가정) 모두 실패 (succ 0%, q ~10⁵ rad 폭주). Method A (forward Brownian + condition-aware sampling init)으로 해결.
-- **Per-trajectory $q^\text{init}$이 결정적 contribution**: ABL3 (제거 시) 91% → 19.5% (-71.5 pp) — Q3 anchor mismatch 진단의 정량 검증.
+- **Per-trajectory $q^\text{init}$이 결정적 contribution**: ABL3 (제거 시) ID 94% → 19% (−75.5 pp) — Q3 anchor mismatch 진단의 정량 검증.
 
-**진행 중** (2026-05-10): ABL2 (proxy_std=ou), pose-baseline 비교 (BC, DP-canonical, DP-channel, Projected) — `metric.md` 통합 metric. 결과 도착 순서대로 §6, §7에 누적 업데이트.
+**완료** (2026-05-10): ABL1/ABL2/ABL3 ablation 3종, pose-baseline 4종 (BC / DP-canonical / DP-channel / Projected) 모두 측정 완료 — `metric.md` 통합 metric.
+
+**주요 finding**:
+1. **Pose accuracy ranking** (ID 평균): DP-channel (100%) ≈ Projected (100%) ≈ DP-canonical (99%) > BC (98%) > **Ours-V2 Method A (94%)** ≫ ABL3 (19%). DP variants가 pose accuracy에서 Method A보다 우위.
+2. **Multimodality 보존 (mfe)**: DP-canonical 0.02, DP-channel 0.025, Projected 0.04, **Method A 0.12**, BC 0.47 (collapse). DP가 mode collapse 방지에서 가장 우수.
+3. **Method A의 남은 contribution**: chart-form score (drift-free Brownian + Varadhan target)이 *원리적으로 manifold-correct sampling*을 보장. Franka의 simple FK retraction 환경에서는 DP+post-projection으로도 비슷한 결과 가능. *복잡한 manifold (e.g. constraint manifold without closed-form retraction)*에서 차별화 가능성 — future work.
+
+---
+
+## 0.1 학습 vs 평가 $z_e$ 분포 — ID vs OOD 명시 ⚠️
+
+**모든 ckpt에서 동일** (Method A, 모든 ablation, 모든 baseline):
+
+| 단계 | $z_e$ 분포 |
+|---|---|
+| **Training** | $z_e \sim \mathrm{Uniform}[0.05, 0.15]$ m (training data 매 batch마다 sampling) |
+| Manifold support | tool_z_max = 0.20 m ($T_\phi$가 정의된 최대 length, 학습엔 안 쓰임) |
+| **Evaluation** | $z_e \in \{0.05, 0.10, 0.15, 0.20\}$ m (4 fixed values, 각 64 samples) |
+
+**평가 z_e의 ID / OOD 구분**:
+
+| $z_e$ | 분류 | 비고 |
+|---|---|---|
+| **0.05** m | **ID — boundary (lower edge)** | training 분포의 하한 boundary. Sampling 분포가 [0.05, 0.15] uniform이므로 0.05는 boundary value지만 training 분포 내부 |
+| **0.10** m | **ID — interior** | training 분포의 정확히 중간. 학습 가장 풍부한 구간 |
+| **0.15** m | **ID — boundary (upper edge)** | training 분포의 상한 boundary |
+| **0.20** m | **OOD — extrapolation** | training max(0.15)에서 +0.05 m 외삽 (**+33%**). $T_\phi$ manifold는 정의되어 있지만 학습 데이터 분포에서 벗어남 |
+
+→ z_e=0.05/0.10/0.15는 in-distribution (ID), z_e=0.20은 **out-of-distribution (OOD)**.
+→ 이후 모든 표/분석에서 ID/OOD를 명시하여 robustness vs generalization을 구분한다.
 
 ---
 
@@ -151,14 +181,16 @@ spike >1e+3:  51 / 15301 (0.3%, 거의 시작 부분)
 
 ### 5.2 Eval (per z_e — tool extension, `metric.md` 통합 set)
 
-| $z_e$ | pos cm | rot ° | pose@5/5° | pose@5/10° | manif gap |
-|---|---|---|---|---|---|
-| 0.05 m | **2.00** | **2.79°** | **95.31%** | 100% | 0.000 mm / 0.005° |
-| 0.10 m | 2.15 | 2.77° | **95.31%** | 100% | ~0 |
-| 0.15 m | 2.53 | 2.93° | 92.19% | 98.44% | ~0 |
-| 0.20 m | 3.24 | 3.15° | 81.25% | 92.19% | ~0 |
+| $z_e$ | 분류 | pos cm | rot ° | pose@5/5° | pose@5/10° | manif gap |
+|---|---|---|---|---|---|---|
+| 0.05 m | ID-boundary | **2.00** | **2.79°** | **95.31%** | 100% | 0.000 mm / 0.005° |
+| 0.10 m | ID-interior | 2.15 | 2.77° | **95.31%** | 100% | ~0 |
+| 0.15 m | ID-boundary | 2.53 | 2.93° | 92.19% | 98.44% | ~0 |
+| 0.20 m | **OOD (+33%)** | 3.24 | 3.15° | 81.25% | 92.19% | ~0 |
 
-**평균** (4개 z_e): pos_err 2.48 cm, rot_err 2.91°, **pose_succ@(5cm,5°) = 91.0%**, manifold gap ≈ 0 (machine precision).
+**ID 평균** (z_e ∈ {0.05, 0.10, 0.15}): pos 2.23 cm, rot 2.83°, **pose@(5cm,5°) = 94.27%**, pose@(5cm,10°) = 99.48%
+**OOD 단일** (z_e = 0.20): pos 3.24 cm, rot 3.15°, **pose@(5cm,5°) = 81.25%** (−13 pp ID 평균 대비)
+**전체 평균** (4 z_e, ID+OOD): pos_err 2.48 cm, rot_err 2.91°, pose_succ@(5cm,5°) = 91.01%, manifold gap ≈ 0 (machine precision).
 
 **(주의)**: 이전 보고된 "succ 51.6%"는 default `--success-pos 0.02` (2cm) threshold 때문에 *position-strict*로 측정됨. `metric.md` standard pose_succ@(5cm, 5°) 기준으로 재평가 시 **95.3%** (z_e=0.05). 표준 metric으로 재계산이 paper의 정확한 성능 수치.
 
@@ -167,9 +199,10 @@ spike >1e+3:  51 / 15301 (0.3%, 거의 시작 부분)
 | 항목 | Position-only V2 | Pose-extended Method A |
 |---|---|---|
 | Target dim | $p \in \mathbb{R}^3$ (3-dim) | $T \in \mathrm{SE}(3)$ (6-dim) |
-| pos_err | 21 mm | 20–32 mm (z_e=0.05–0.20) |
+| pos_err | 21 mm | ID: 20–25 mm, OOD: 32 mm |
 | Success criterion | pos < 5 cm | pos < 5 cm AND rot < 5° (`metric.md` strict) |
-| succ rate | ~95% | 81–95% (z_e=0.05–0.20) — **average 91%** |
+| succ rate (ID) | ~95% | **94.27%** (ID 평균) |
+| succ rate (OOD z_e=0.20) | n/a | 81.25% |
 
 Position 정밀도는 동등 ($\approx$ 2 cm). Rotation을 strict 5°로 추가 measure해도 succ rate 거의 유지 (z_e≤0.10에서 95%) — rotation precision (mean 2.79°)이 5° threshold 안에 안정적으로 들어감이 SE(3) extension의 강점.
 
@@ -179,44 +212,47 @@ Position 정밀도는 동등 ($\approx$ 2 cm). Rotation을 strict 5°로 추가 
 
 $\sigma_K$ / proxy_std mode / per-trajectory $q^\text{init}$ 셋이 *각각* 얼마나 critical한지 측정. 다른 모든 hyperparameter는 동일.
 
-### 6.1 Ablation 결과 표 (`metric.md` 통합 metric, ABL2 측정 중)
+### 6.1 Ablation 결과 표 (`metric.md` 통합 metric)
 
-`pose_succ@(5cm, 5°)` 기준 (strict full-pose criterion).
+`pose_succ@(5cm, 5°)` 기준 (strict full-pose criterion). z_e=0.05/0.10/0.15는 **ID** (training $\mathrm{Uniform}[0.05, 0.15]$), z_e=0.20은 **OOD** (+33% extrapolation).
 
-| 설정 | $\sigma_K$ | proxy_std | $q^\text{init}$ | z_e=0.05 | z_e=0.10 | z_e=0.15 | z_e=0.20 | **평균** |
-|---|---|---|---|---|---|---|---|---|
-| **Method A (full)** | 1.414 | brownian | per-traj | **95.31%** | 95.31% | 92.19% | 81.25% | **91.01%** |
-| ABL1 (σ_K=0.6) | 0.6 | brownian | per-traj | 96.88% | 98.44% | 98.44% | 90.62% | 96.10% |
-| **ABL3 (q_init=μ_q)** | 1.414 | brownian | **single μ_q** | **17.19%** | 20.31% | 18.75% | 21.88% | **19.53%** |
-| ABL2 (proxy_std=ou) | 1.414 | **ou** | per-traj | 89.06% | 90.62% | 87.50% | 75.00% | 85.55% |
+| 설정 | $\sigma_K$ | proxy_std | $q^\text{init}$ | ID-boundary 0.05 | ID-interior 0.10 | ID-boundary 0.15 | **OOD 0.20** | **ID 평균** | **전체 평균** |
+|---|---|---|---|---|---|---|---|---|---|
+| **Method A (full)** | 1.414 | brownian | per-traj | **95.31%** | 95.31% | 92.19% | **81.25%** | **94.27%** | 91.01% |
+| ABL1 (σ_K=0.6) | 0.6 | brownian | per-traj | 96.88% | 98.44% | 98.44% | **90.62%** | 97.92% | 96.10% |
+| **ABL3 (q_init=μ_q)** | 1.414 | brownian | **single μ_q** | **17.19%** | 20.31% | 18.75% | **21.88%** | **18.75%** | 19.53% |
+| ABL2 (proxy_std=ou) | 1.414 | **ou** | per-traj | 89.06% | 90.62% | 87.50% | **75.00%** | 89.06% | 85.55% |
 
-### 6.2 Component-wise contribution
+### 6.2 Component-wise contribution (ID 기준 분석)
 
-**ABL3 (per-trajectory q_init 제거)** — **−78.1 pp at z_e=0.05** (95.31% → 17.19%):
-- 모든 z_e에서 Method A 대비 ~70-80 pp 약화 (평균 91.01% → 19.53%, **−71.5 pp**)
+**ABL3 (per-trajectory q_init 제거)** — **ID 평균 94.27% → 18.75% (−75.5 pp)**:
+- ID 모든 z_e에서 ~75-80 pp 약화 (z_e=0.05: 95.31% → 17.19%, z_e=0.10: 95.31% → 20.31%, z_e=0.15: 92.19% → 18.75%)
+- OOD에서도 81.25% → 21.88% (−59 pp)
 - rot_err: Method A 2.79° → ABL3 9.95° (3.6× 악화); pos_err 2.00 → 4.39 cm (2.2× 악화)
 - 통계적 매우 견고 (95% CI ±12 pp을 6배 이상 초과)
 - → **Per-trajectory $q^\text{init}$이 Method A의 결정적 core contribution**. 진단의 Q3 (anchor mismatch) 가설 정량 검증.
 
-**ABL1 (σ_K=0.6 legacy)** — **+1.6 pp at z_e=0.05** (95.31% → 96.88%, 평균 +5 pp):
-- 모든 z_e에서 Method A보다 약간 더 나음
+**ABL1 (σ_K=0.6 legacy)** — **ID 평균 +3.65 pp** (94.27% → 97.92%):
+- ID 모든 z_e에서 Method A보다 약간 더 나음 (z_e=0.05: +1.6 pp, z_e=0.10: +3.1 pp, z_e=0.15: +6.3 pp)
+- OOD에서도 +9.4 pp (81.25% → 90.62%) — narrower init이 OOD에서 더 도움
 - 통계적 marginal — 95% CI ±12 pp 이내
 - σ_K calibration은 *spec 정밀화*로 옳지만 *empirical 효과 marginal* — robustness signal
-- Forward marginal과 정합한 σ_K=1.414 vs legacy 0.6이 비슷하거나 약간 더 narrow init이 유리 — score net의 effective coverage 영역과 관련 (paper에서 추가 분석 가능)
+- Forward marginal과 정합한 σ_K=1.414 vs legacy 0.6: 비슷하거나 narrow init이 유리 — score net의 effective coverage 영역과 관련
 
-**ABL2 (proxy_std = ou)** — **−5.46 pp 평균** (91.01% → 85.55%):
-- 모든 z_e에서 약간씩 약화 (−6.25 pp at z_e=0.05, −6.25 pp at z_e=0.20)
+**ABL2 (proxy_std = ou)** — **ID 평균 −5.21 pp** (94.27% → 89.06%):
+- ID 모든 z_e에서 약간씩 약화 (z_e=0.05: −6.25 pp, z_e=0.10: −4.69 pp, z_e=0.15: −4.69 pp)
+- OOD에서도 −6.25 pp (81.25% → 75.00%)
 - 통계적으로 약하지만 consistent (모든 4개 z_e에서 monotone negative)
 - proxy_std는 학습 시 std_trick scale + loss weight $w(r) = \sigma^2(r)$에 들어감 → drift-free Brownian forward에서 OU std로 normalize 시 큰 r 영역 weight가 saturated → 큰 r에 학습 capacity 부족 → reverse SDE 큰 r 단계에서 score quality 저하
 - → proxy_std calibration 효과는 marginal하지만 **consistent하게 positive** (Brownian이 정합)
 
-### 6.3 Component contribution ranking (`metric.md` strict criterion)
+### 6.3 Component contribution ranking (`metric.md` strict, ID 기준)
 
-| 순위 | Component | 평균 영향 | 근거 |
-|---|---|---|---|
-| **1** | **Per-trajectory $q^\text{init}$** | **−71.5 pp** | ABL3에서 결정적 collapse (95% → 19%) |
-| 2 | proxy_std = brownian mode | +5.5 pp | ABL2 모든 z_e에서 consistent negative |
-| 3 | σ_K = √τ_brown(K) | −5.1 pp | ABL1에서 약간 더 좋음, robustness signal |
+| 순위 | Component | ID 평균 영향 | OOD 영향 | 근거 |
+|---|---|---|---|---|
+| **1** | **Per-trajectory $q^\text{init}$** | **−75.5 pp** | **−59.4 pp** | ABL3에서 결정적 collapse (94% → 19%) |
+| 2 | proxy_std = brownian mode | +5.2 pp | +6.3 pp | ABL2 모든 z_e에서 consistent negative |
+| 3 | σ_K = √τ_brown(K) | −3.7 pp | −9.4 pp | ABL1에서 약간 더 좋음, OOD에서 더 큼 |
 
 (2,3은 통계적 noise 범위, 1만 명확한 signal)
 
@@ -229,55 +265,201 @@ Pose-extended baseline을 동일 framework에서 학습하여 Ours-V2 (Method A)
 | Baseline | 설명 | 상태 |
 |---|---|---|
 | BC | Deterministic regressor $c \to q$-trajectory | ✓ 완료 |
-| DP-canonical (global cond) | Standard Diffusion Policy (Chi23) | 진행 중 (GPU 0) |
-| DP-channel | DP-A variant (channel-concat cond, parity with Ours) | 대기 (GPU 1) |
-| Projected | Ambient (q, T_storage) DP + projection via $H_\phi^\text{pose}$ | 대기 (GPU 1) |
+| DP-canonical (global cond) | Standard Diffusion Policy (Chi23) | ✓ 완료 |
+| DP-channel | DP-A variant (channel-concat cond, parity with Ours) | ✓ 완료 |
+| Projected | Ambient (q, T_storage) DP + projection via $H_\phi^\text{pose}$ | ✓ 완료 |
 
 **조건**: 동일 conditioning $c = (T_\text{start} \oplus T_\text{target} \oplus z_e) \in \mathbb{R}^{15}$, 동일 demo 분포, H+1=16, batch=64, steps=15000.
 
 ### 7.1 BC (Behavioral Cloning) 결과
 
-| $z_e$ | pos cm | rot ° | pose@5/5° | pose@5/10° | mode frac err | manif gap | jvio |
-|---|---|---|---|---|---|---|---|
-| 0.05 | 2.00 | 3.09 | **95.31%** | 100% | **0.47** | 0 | 0% |
-| 0.10 | 1.94 | 2.63 | **100%** | 100% | 0.47 | 0 | 0% |
-| 0.15 | 2.40 | 2.64 | 98.44% | 100% | 0.47 | 0 | 0% |
-| 0.20 | 3.62 | 3.05 | 85.94% | 87.5% | 0.47 | 0 | 0% |
-| **평균** | **2.49** | **2.85** | **94.92%** | **96.88%** | **0.47** | **0** | **0%** |
+| $z_e$ | 분류 | pos cm | rot ° | pose@5/5° | pose@5/10° | mode frac err | manif gap | jvio |
+|---|---|---|---|---|---|---|---|---|
+| 0.05 | ID-boundary | 2.00 | 3.09 | **95.31%** | 100% | **0.47** | 0 | 0% |
+| 0.10 | ID-interior | 1.94 | 2.63 | **100%** | 100% | 0.47 | 0 | 0% |
+| 0.15 | ID-boundary | 2.40 | 2.64 | 98.44% | 100% | 0.47 | 0 | 0% |
+| 0.20 | **OOD** | 3.62 | 3.05 | **85.94%** | 87.5% | 0.47 | 0 | 0% |
+| **ID 평균** | (3 z_e) | 2.11 | 2.79 | **97.92%** | 100% | 0.47 | 0 | 0% |
+| **전체 평균** | (4 z_e) | 2.49 | 2.85 | 94.92% | 96.88% | 0.47 | 0 | 0% |
 
-학습 시간 ~3시간, model 1.12 M params (UNet 10M의 1/9).
+학습 시간 ~3시간, model 1.12 M params (UNet 10M의 1/9). OOD에서 ID 대비 −12 pp.
 
-### 7.2 Method A vs BC — *pose accuracy 동등, multimodality 차이*
+### 7.2 Method A vs BC — *pose accuracy 동등, BC는 mode collapse*
 
 | Metric | **Method A** | **BC** | 차이 |
 |---|---|---|---|
-| pose_succ@(5cm,5°) avg | 91.01% | **94.92%** | BC +3.9 pp |
-| pose_succ@(5cm,10°) avg | 97.66% | 96.88% | tie |
+| pose_succ@(5cm,5°) **ID 평균** | 94.27% | **97.92%** | BC +3.7 pp |
+| pose_succ@(5cm,5°) **OOD (z_e=0.20)** | **81.25%** | 85.94% | BC +4.7 pp |
+| pose_succ@(5cm,5°) 전체 평균 | 91.01% | **94.92%** | BC +3.9 pp |
+| pose_succ@(5cm,10°) 전체 | 97.66% | 96.88% | tie |
 | pos_err mean (cm) | 2.48 | 2.49 | tie |
 | rot_err mean (°) | 2.91 | 2.85 | tie |
-| **mode_frac_err** | **0.12** | **0.47** | **Method A 4× better** |
+| **mode_frac_err** | **0.12** | **0.47 (collapse)** | Method A 4× better |
 | manifold gap (mm) | ~0 | ~0 | tie (둘 다 H_φ로 lift) |
 | joint viol rate | 0% | 0% | tie |
 
 **핵심 관찰**:
 - **Pose accuracy**: BC가 *근소하게* 더 높음 (단일 seed noise 범위)
-- **Multimodality**: Method A가 *4× 더 잘 보존*. BC의 mode_frac_err = 0.47은 demo bimodal balance (0.5)에서 한 mode로 ~97% collapse한 것.
+- **Multimodality**: Method A가 BC 대비 *4× 더 잘 보존*. BC mfe 0.47은 한 mode로 ~97% collapse — BC의 deterministic regression 한계.
 - **Manifold adherence**: 둘 다 ≈ 0 (BC는 $q$만 출력 후 $H_\phi^\text{pose}$로 lift, Method A는 sample이 매니폴드 위 by construction)
 
-→ Paper의 contribution은 "**pose accuracy가 우위**"가 아니라 "**같은 pose accuracy를 *bimodal distribution을 보존하면서* 달성**". `metric.md` §7.1이 예측한 BC의 mode collapse 약점이 정확히 정량 검증됨.
+→ BC와의 비교에서 Method A는 *pose accuracy 동등 + multimodality 보존*. 그러나 §7.3–7.5에서 보듯 DP variants도 pose accuracy 우위 + multimodality (mfe 0.02–0.04)에서 Method A보다 더 강함 — BC vs Method A 비교만으로는 contribution claim이 충분하지 않음.
 
-**남은 baseline**: DP-canonical (mode capture 능력 있음, 진짜 강한 비교), DP-channel (Ours architecture parity), Projected (manifold gap 차이 측정).
+### 7.3 DP-canonical (Global-cond Diffusion Policy) 결과
+
+| $z_e$ | 분류 | pos cm | rot ° | pose@5/5° | pose@5/10° | mode frac err | manif gap | jvio |
+|---|---|---|---|---|---|---|---|---|
+| 0.05 | ID-boundary | 1.91 | 2.45 | 98.44% | 100% | 0.02 | 0 | 0% |
+| 0.10 | ID-interior | 2.04 | 2.50 | **100%** | 100% | 0.02 | 0 | 0% |
+| 0.15 | ID-boundary | 2.40 | 2.59 | 98.44% | 100% | 0.02 | 0 | 0% |
+| 0.20 | **OOD** | 3.11 | 2.69 | **95.31%** | 96.88% | 0.00 | 0 | 0% |
+| **ID 평균** | (3 z_e) | 2.12 | 2.51 | **98.96%** | 100% | 0.02 | 0 | 0% |
+| **전체 평균** | (4 z_e) | 2.36 | 2.56 | 98.05% | 99.22% | 0.015 | 0 | 0% |
+
+학습 시간 ~3시간, model 10M params (UNet 1d, global-cond 표준 Diffusion Policy / Chi23). q는 ambient $q$-only 출력 후 $H_\phi^\text{pose}$로 lift.
+
+**핵심 관찰**:
+- **ID 98.96%, OOD 95.31% pose succ — Method A (94.27% / 81.25%)보다 우위**
+- mode frac err 0.02 — Method A (0.12)보다 6× 우수, BC (0.47) 대비 23× 우수
+- manifold gap = 0 (lift via $H_\phi^\text{pose}$, by construction)
+- OOD에서 ID 대비 −3.65 pp 작은 drop
+
+→ **Standard DP가 SE(3) trajectory를 잘 학습**. Conditioning이 충분히 강하고 (T_start ⊕ T_target ⊕ z_e ∈ R^{15}), DDPM이 multimodal demo distribution을 자연스럽게 capture.
+
+### 7.4 DP-channel (channel-concat conditioning, Ours-A architecture parity) 결과
+
+Ours-V2와 architecture parity (UNet 1d, channel-concat).
+
+| $z_e$ | 분류 | pos cm | rot ° | pose@5/5° | pose@5/10° | mode frac err | manif gap | jvio |
+|---|---|---|---|---|---|---|---|---|
+| 0.05 | ID-boundary | 1.77 | 2.27 | **100%** | 100% | 0.02 | 0 | 0% |
+| 0.10 | ID-interior | 1.83 | 2.31 | **100%** | 100% | 0.02 | 0 | 0% |
+| 0.15 | ID-boundary | 2.22 | 2.51 | **100%** | 100% | 0.03 | 0 | 0% |
+| 0.20 | **OOD** | 3.03 | 2.74 | **96.88%** | 96.88% | 0.06 | 0 | 0% |
+| **ID 평균** | (3 z_e) | 1.94 | 2.36 | **100%** | 100% | 0.023 | 0 | 0% |
+| **전체 평균** | (4 z_e) | 2.21 | 2.46 | 99.22% | 99.22% | 0.033 | 0 | 0% |
+
+학습 시간 ~2:50, model 10.20M params (UNet 1d, channel-concat conditioning — Ours-A와 동일 architecture).
+
+**핵심 관찰**:
+- **ID 100%, OOD 96.88% — 모든 baseline 중 가장 높은 pose accuracy**
+- channel-concat이 global-cond 대비 약간 우위 (ID +1 pp, OOD +1.6 pp)
+- Method A (94.27% / 81.25%) 대비 +5.7 pp / +15.6 pp 우위
+- mfe 0.023 — DP-canonical보다 약간 높지만 여전히 매우 낮음
+
+→ **Method A와 DP-channel은 architecture/cond/data/compute가 동일** (UNet 1d, channel-concat $c$, 10M params, batch 64, 15k steps). 차이는 score formulation만:
+- DP-channel: standard $\epsilon$-prediction loss → **ID 100%, OOD 96.88%**
+- Method A: chart-form Riemannian DSM (drift-free Brownian, Varadhan) → **ID 94.27%, OOD 81.25%**
+
+→ Pose accuracy에서 standard DP 가 Method A 보다 우위. 이는 Method A의 contribution이 *pose accuracy*가 아니라 *원리적 manifold consistency* (machine-precision manifold gap, 이는 DP도 $H_\phi^\text{pose}$ post-projection으로 동일 달성) 또는 *복잡 manifold extension*에 있음을 시사.
+
+### 7.5 Projected (ambient $(q, T)$ DP + retraction) 결과
+
+ambient state는 $(q, T_\text{storage}) \in \mathbb{R}^{14}$ DP, 출력 후 $T$-block을 $T_\phi(q, z_e)$로 overwrite (manifold projection).
+
+| $z_e$ | 분류 | pos cm | rot ° | pose@5/5° | pose@5/10° | mode frac err | manif gap | jvio |
+|---|---|---|---|---|---|---|---|---|
+| 0.05 | ID-boundary | 1.78 | 2.31 | **100%** | 100% | 0.02 | 0 | 0% |
+| 0.10 | ID-interior | 1.89 | 2.50 | **100%** | 100% | 0.02 | 0 | 0% |
+| 0.15 | ID-boundary | 2.20 | 2.59 | **100%** | 100% | 0.05 | 0 | 0% |
+| 0.20 | **OOD** | 2.90 | 2.59 | **95.31%** | 95.31% | 0.05 | 0 | 0% |
+| **ID 평균** | (3 z_e) | 1.96 | 2.47 | **100%** | 100% | 0.030 | 0 | 0% |
+| **전체 평균** | (4 z_e) | 2.19 | 2.50 | 98.83% | 98.83% | 0.035 | 0 | 0% |
+
+학습 시간 ~4시간, model 10M params, ambient $(q, T)$ 출력 후 retraction projection.
+
+**핵심 관찰**:
+- **ID 100%, OOD 95.31% — DP-channel과 거의 동등**
+- ambient (q, T) state space에서 학습하고 projection으로 manifold 만족 → 잘 작동
+- mfe 0.030, multimodality 보존 양호
+- OOD에서 trajectory 다소 거침 (E_vel/E_acc 차이는 §부록 참고)
+
+→ Manifold post-projection 방식도 정상 작동. Method A의 *intrinsic* manifold formulation 대비 비교적 simpler approach가 같은 수준의 결과 달성.
+
+---
+
+### 7.6 최종 비교표 — paper-ready main result
+
+**Training**: $z_e \sim \mathrm{Uniform}[0.05, 0.15]$ (모든 모델 동일).
+**Eval**: ID = z_e ∈ {0.05, 0.10, 0.15}, OOD = z_e = 0.20 (+33% extrapolation).
+
+#### 7.6.1 In-distribution (ID, z_e ∈ {0.05, 0.10, 0.15})
+
+| 모델 | params | pos cm | rot ° | **pose@(5cm,5°) ID** | pose@(5cm,10°) ID | manif gap (mm) | mode frac err |
+|---|---|---|---|---|---|---|---|
+| BC | 1.12 M | 2.11 | 2.79 | 97.92% | 100% | 0 | **0.47 (collapse)** |
+| DP-canonical | 10 M | 2.12 | 2.51 | 98.96% | 100% | 0 | **0.02** |
+| **DP-channel** | 10.20 M | **1.94** | **2.36** | **100%** | 100% | 0 | 0.023 |
+| Projected | 10 M | 1.96 | 2.47 | 100% | 100% | 0 | 0.030 |
+| Ours-V2 Method A | 10 M | 2.23 | 2.83 | 94.27% | 99.48% | 0 | 0.12 |
+
+#### 7.6.2 Out-of-distribution (OOD, z_e = 0.20 — +33% beyond training max)
+
+| 모델 | pos cm | rot ° | **pose@(5cm,5°) OOD** | pose@(5cm,10°) OOD | OOD vs ID drop |
+|---|---|---|---|---|---|
+| BC | 3.62 | 3.05 | 85.94% | 87.5% | −12.0 pp |
+| DP-canonical | 3.11 | 2.69 | 95.31% | 96.88% | −3.65 pp |
+| **DP-channel** | **3.03** | **2.74** | **96.88%** | 96.88% | **−3.12 pp** |
+| Projected | 2.90 | 2.59 | 95.31% | 95.31% | −4.69 pp |
+| Ours-V2 Method A | 3.24 | 3.15 | 81.25% | 92.19% | −13.0 pp |
+
+#### 7.6.3 평균 (ID+OOD, 4 z_e — reference only)
+
+| 모델 | params | pos cm | rot ° | pose@(5cm,5°) | pose@(5cm,10°) | mode frac err |
+|---|---|---|---|---|---|---|
+| BC | 1.12 M | 2.49 | 2.85 | 94.92% | 96.88% | 0.47 |
+| DP-canonical | 10 M | 2.36 | 2.56 | 98.05% | 99.22% | 0.015 |
+| **DP-channel** | 10.20 M | **2.21** | **2.46** | **99.22%** | 99.22% | 0.033 |
+| Projected | 10 M | 2.19 | 2.50 | 98.83% | 98.83% | 0.035 |
+| Ours-V2 Method A | 10 M | 2.48 | 2.91 | 91.01% | 97.66% | 0.12 |
+
+
+**핵심 finding**:
+
+1. **Pose accuracy ranking (ID)**: DP-channel (100%) ≈ Projected (100%) ≈ DP-canonical (99%) > BC (98%) > **Method A (94%)** ≫ ABL3 (19%)
+   - 모든 generative baseline (DP-*, Projected)이 deterministic BC보다도 우위 — DP의 multimodal modeling이 효과적
+   - **Method A가 pose accuracy에서 DP보다 약간 뒤처짐** (−5 pp)
+
+2. **Multimodality (mfe, lower is better)**: DP-canonical (0.015) < DP-channel (0.033) ≈ Projected (0.035) < Method A (0.12) ≪ BC (0.47, collapse)
+   - Generative baseline 모두 bimodal distribution 잘 보존 (mfe < 0.05)
+   - **Method A의 mfe 0.12는 DP variants 대비 4–8× 나쁨** (그러나 BC 대비 4× 우수)
+   - BC만 mode collapse 발생
+
+3. **Manifold adherence**: 모든 모델이 manif gap = 0
+   - Method A: by construction (chart-form score, intrinsic)
+   - 다른 baseline: post-projection via $H_\phi^\text{pose}$ retraction
+   - 둘 다 같은 결과 → simple FK retraction이 가능한 manifold에서는 차별화 안 됨
+
+4. **OOD (+33% extrapolation)**:
+   - DP-channel: 100% → 96.88% (drop −3.1 pp)
+   - DP-canonical: 99% → 95.31% (drop −3.7 pp)
+   - Projected: 100% → 95.31% (drop −4.7 pp)
+   - BC: 97.92% → 85.94% (drop −12 pp)
+   - **Method A: 94.27% → 81.25% (drop −13 pp)** — OOD에서 **가장 큰 drop**
+   - DP variants는 stochastic generative model로서 OOD에서도 robust; Method A는 anchor q_init이 ID 분포에 specialize되어 OOD에서 약화
+
+5. **Architecture-parity head-to-head 재해석**: DP-channel과 Method A는 동일 architecture/cond/data/compute. Score formulation 차이:
+   - DP-channel ($\epsilon$-prediction): ID 100%, OOD 96.88%, mfe 0.033
+   - Method A (chart-form Riemannian DSM): ID 94.27%, OOD 81.25%, mfe 0.12
+   - **DP-channel이 Method A보다 모든 metric에서 우위** (Franka FK retraction-friendly setup에서)
+
+→ **Paper의 narrative 재구성 필요**: Method A는 Franka pose task에서 DP를 능가하지 못함. Method A의 이론적 강점 (chart-form score, drift-free Brownian on Riemannian manifold)이 *실제 우위로 발현되려면* DP의 post-projection으로 안 되는 환경이 필요함. 예:
+- closed-form retraction이 없는 implicit constraint manifold (e.g. SE(3) sub-manifold from contact constraints)
+- 동시-equality 제약 (contact + joint limit) 등에서 chart 기반 sampling이 필수
+- Higher-dim multi-body system에서 retraction이 expensive
+→ Franka 7-DoF + simple tool-z FK는 그러한 환경이 *아니므로* DP variant들이 잘 작동.
 
 ---
 
 ## 8. 알려진 한계
 
-### 8.1 z_e robustness 약화
+### 8.1 OOD ($z_e=0.20$) generalization 약화
 
-- z_e=0.20 (longest tool, large lever arm)에서 pose_succ@(5cm,5°) 81.25% — Method A의 z_e=0.05의 95% 대비 −14 pp
-- relaxed threshold pose_succ@(5cm,10°)는 92.19%로 z_e robustness가 *rotation*에서 더 두드러짐
-- 가능한 원인: tool 길이가 EE pose에 강한 dependency (특히 rotation rate), score net의 z_e conditioning이 이 dependency를 충분히 학습 못함
-- 잠재적 해결: reward guidance (Stage 6'), z_e-conditional weighting, 또는 z_e dimension에 expanded encoding
+- Training은 $z_e \sim \mathrm{Uniform}[0.05, 0.15]$, $z_e=0.20$은 **+33% OOD extrapolation**
+- Method A: ID 평균 94.27% → OOD 81.25% (**−13 pp**), pose@(5cm,10°)는 OOD 92.19%로 회복
+- BC도 비슷한 pattern (ID 97.92% → OOD 85.94%, **−12 pp**) — OOD 약화는 generative 형태와 무관
+- 가능한 원인: tool 길이가 EE pose에 강한 dependency (특히 rotation rate), score net의 z_e conditioning extrapolation 능력 한계
+- 잠재적 해결: training z_e range 확장 ([0.05, 0.20]으로 학습 시 OOD 영역 ID로 흡수), z_e-conditional weighting, z_e dimension에 expanded encoding, reward guidance
 
 ### 8.2 Rotation 정밀도
 
@@ -336,10 +518,10 @@ Pose-extended baseline을 동일 framework에서 학습하여 Ours-V2 (Method A)
 
 | # | 의심 | 상태 |
 |---|---|---|
-| Q1 | drift OFF + pose 미측정 | ✓ Method A로 첫 measurement, 작동 확인 (pose_succ@(5cm,5°)=91%) |
+| Q1 | drift OFF + pose 미측정 | ✓ Method A로 첫 measurement, 작동 확인 (ID pose_succ@(5cm,5°)=94.27%, OOD=81.25%) |
 | Q2 | anchor approximation 무효 | ✓ Method A에서 anchor 자체 제거로 해소 |
-| **Q3** | **Score net과 SDE의 anchor mismatch** | ✓ **ABL3에서 −71.5 pp 평균 (z_e=0.05에선 −78.1 pp) 로 정량 검증** |
+| **Q3** | **Score net과 SDE의 anchor mismatch** | ✓ **ABL3에서 ID −75.5 pp / OOD −59.4 pp 로 정량 검증** |
 | Q4.1 | Langevin forward + Varadhan target 비정합 | ✓ drift 제거 시 학습 자체 정상화 (loss 1e+13 → 1e+1) |
-| Q4.7 | σ_K calibration | △ ABL1에서 측정, marginal 차이만 (robustness signal) |
+| Q4.7 | σ_K calibration | △ ABL1에서 측정, marginal 차이만 (ID +3.7 pp, OOD +9.4 pp) |
 
 **결론**: Q3가 가장 큰 ROI. Q1/Q2/Q4.1는 baseline 작동 자체를 결정. Q4.7은 spec 정밀화이지만 empirical 차이 미미.
