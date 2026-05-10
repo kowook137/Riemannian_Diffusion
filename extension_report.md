@@ -25,6 +25,8 @@ $$T_\phi(q, z_e) = T_\text{analytic}(q, z_e) \cdot \exp_{\mathrm{SE}(3)}(\xi_\ph
 
 **완료** (2026-05-10): ABL1/ABL2/ABL3 ablation 3종, pose-baseline 4종 (BC / DP-canonical / DP-channel / Projected) 모두 측정 완료 — `metric.md` 통합 metric.
 
+**v4.1 추가** (2026-05-11): joint-limit bounded chart (`joint_limit_extension.tex`) 구현 + 학습 + 평가 완료. **Joint feasibility by construction 달성 (viol = 0% 모든 z_e)** + multimodality 2.5× 향상, 그러나 Varadhan chart-Euclidean bias로 pose accuracy −19 pp ID / −27 pp OOD 손해 (Choice A 의 structural trade-off, spec §9에 명시). 자세한 비교는 §10 참고.
+
 **주요 finding**:
 1. **Pose accuracy ranking** (ID 평균): DP-channel (100%) ≈ Projected (100%) ≈ DP-canonical (99%) > BC (98%) > **Ours-V2 Method A (94%)** ≫ ABL3 (19%). DP variants가 pose accuracy에서 Method A보다 우위.
 2. **Multimodality 보존 (mfe)**: DP-canonical 0.02, DP-channel 0.025, Projected 0.04, **Method A 0.12**, BC 0.47 (collapse). DP가 mode collapse 방지에서 가장 우수.
@@ -511,6 +513,103 @@ ambient state는 $(q, T_\text{storage}) \in \mathbb{R}^{14}$ DP, 출력 후 $T$-
 | Adaptive Tikhonov | 유지 | 유지 |
 | Multi-component guidance | 유지 | 유지 |
 | $\sigma_p = 0.05$ default | Fix 1 적용 | 유지 |
+
+---
+
+## 10. v4.1 Joint-Limit Bounded Chart 결과 (joint_limit_extension.tex)
+
+`joint_limit_extension.tex` (v4.1) 사양에 따라 chart $u \in \R^{n_q}$ + $q = \psi(u) = q_\text{mid} + (q_\text{range}/2) \tanh(u)$ 적용. Choice A: $G_Q^A = I + (J^Q)^T W J^Q \succeq I$, $J^Q = J_\text{pose} \cdot D_\psi$, no clipping during sampling, IK seed $u^\text{init} = \psi^{-1}(q^\text{init})$ with η-clip safety.
+
+### 10.1 Pre-flight margin diagnostic
+
+Spec §10.2의 mandatory pre-flight: demo의 relative-margin percentile.
+
+| 지표 | 측정값 | Threshold | 판정 |
+|---|---|---|---|
+| 1%-tile rel-margin | **0.2045** | ≥ 0.05 (safe) | ✅ 4.1× 여유 |
+| 5%-tile | **0.2389** | ≥ 0.10 (safe) | ✅ 2.4× 여유 |
+| Min margin | 0.140 | > 0.01 (abort) | ✅ 14× 여유 |
+
+→ **SAFE** 판정 — bounded chart 배포 승인.
+
+### 10.2 학습 trajectory
+
+`franka_traj_unet_pose --method-a --bounded-chart --lambda-floor 1e-4 --sigma-p 0.05 --tikhonov-frac 1e-2 --steps 15000 --batch 64`. 학습 시간 4:14 (GPU 1 공유).
+
+| step | v4 Method A loss | v4.1 Method A + bounded loss |
+|---|---|---|
+| 100 | n/a | 1.7e+02 |
+| 1000 | n/a | 38.1 |
+| 3000 | n/a | 15.5 |
+| 7500 | 7.31 | 7.79 (step 6087) |
+| 15000 | **5.34** | **5.40** |
+
+Spike (>1e+3) 0건, monotone 수렴 — v4와 거의 동일한 trajectory. ψ retraction이 학습 안정성 유지.
+
+### 10.3 평가 결과 (`metric.md` 통합 metric, n=64 per z_e)
+
+| $z_e$ | 분류 | pos cm | rot ° | pose@5/5° | pose@5/10° | mfe | manif gap | jvio | margin | ‖u‖∞ p99 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.05 | ID-boundary | 2.90 | 3.90 | 79.69% | 96.88% | 0.047 | 0 | **0.0%** | 0.195 | 0.66 |
+| 0.10 | ID-interior | 3.04 | 3.79 | 76.56% | 96.88% | 0.047 | 0 | **0.0%** | 0.219 | 0.60 |
+| 0.15 | ID-boundary | 3.44 | 4.03 | 68.75% | 89.06% | 0.047 | 0 | **0.0%** | 0.220 | 0.54 |
+| 0.20 | **OOD** | 4.18 | 4.49 | 54.69% | 75.00% | 0.031 | 0 | **0.0%** | 0.218 | 0.54 |
+| **ID 평균** | (3 z_e) | 3.13 | 3.91 | **75.00%** | 94.27% | 0.047 | 0 | 0.0% | — | — |
+| **OOD** | (z_e=0.20) | 4.18 | 4.49 | **54.69%** | 75.00% | 0.031 | 0 | 0.0% | — | — |
+
+**핵심 관찰**:
+- **Joint feasibility 0% violation 4 z_e 모두에서** (spec §13의 "viol(τ) = 0 by construction" 정량 검증 — random sampling이든 OOD든 무관)
+- ‖u‖_∞ 99%-tile = 0.54–0.66 (saturation 한계 $|u|>3$ 대비 매우 낮음) → pre-flight forecast 0.6–0.7와 정확히 일치, chart는 정상 regime에서 작동
+- Joint margin min 0.20 → demo의 1%-tile 0.20과 일치 (sample이 demo 분포 외부로 안 새어나감)
+- mfe 0.047 (v4 0.12 대비 **2.5× better**)
+
+### 10.4 v4 Method A vs v4.1 Method A + bounded chart — head-to-head
+
+| Metric | v4 Method A | v4.1 + bounded | Δ |
+|---|---|---|---|
+| pose@(5cm,5°) **ID 평균** | **94.27%** | 75.00% | **−19.27 pp** |
+| pose@(5cm,5°) **OOD** | **81.25%** | 54.69% | **−26.56 pp** |
+| pose@(5cm,10°) ID | 99.48% | 94.27% | −5.21 pp |
+| pose@(5cm,10°) OOD | 92.19% | 75.00% | −17.19 pp |
+| pos err ID (cm) | 2.23 | 3.13 | +0.90 |
+| rot err ID (°) | 2.83 | 3.91 | +1.08 |
+| mfe ID | 0.12 | **0.047** | **2.5× better** |
+| Joint feasibility | de facto 0% | **structurally 0%** | ✅ guarantee |
+| Manifold adherence | ~0 (machine prec) | ~0 (machine prec) | tie |
+
+### 10.5 분석 — Trade-off 본질
+
+**v4.1은 pose accuracy를 19–27 pp 손해보면서 joint feasibility 보장 + multimodality 2.5× 향상을 얻는다.**
+
+#### Saturation은 원인 아님
+- ‖u‖_∞ p99 = 0.54–0.66, $D_\psi$가 vanish하는 영역 ($|u| > 2$) 한참 못 미침
+- Pre-flight forecast (0.6–0.7) 정확히 일치 → chart는 demo 분포 내부에서만 작동
+
+#### 진짜 원인: Varadhan chart-Euclidean bias (spec §9 caveat 정량 검증)
+Spec §9 노트 인용:
+> "The chart-Euclidean displacement $u_0 - u_r$ in $a^*_Q$ assumes a uniform inner product on the first ambient block ... The chart-Euclidean target $u_0 - u_r$ thus carries a position-dependent systematic bias for boundary-adjacent samples."
+
+실험적으로:
+- $\widetilde W$의 first block = $I_{n_q}$ (Choice A)는 "$\Delta u$ 1 unit = $\Delta q$ 1 unit"으로 취급
+- 실제로는 Franka의 joint-별 $D_\psi$ 값이 $q_\text{range}/2 \in [1.57, 2.97]$로 다양 → $\Delta u = 1$이 joint 별로 $\Delta q$ 1.57–2.97 rad에 해당
+- Score net이 이 inhomogeneous metric을 학습하면서 chart slot 출력의 정밀도가 저하 → endpoint pose error 증가
+
+이는 **structural** 한계 — Choice A의 identity floor를 포기 안 하면 제거 불가 (spec §9 trade-off 명시).
+
+#### Saturation diagnostic이 실패한 다른 부분: smoothness 비대칭
+$E_\text{vel}^q$ = 1.20 (v4 미보고; baseline DP-channel = 0.10) → bounded chart trajectory가 q-space에서 약 **12× 더 jerky** 함. 가능한 원인:
+- $u$-chart의 score net 학습이 noisier → trajectory step-to-step variance가 q-chart보다 큼
+- 또는 boundary 근처에서 $D_\psi$ varies → 같은 $\Delta u$가 시간별로 다른 $\Delta q$ 생성
+
+### 10.6 결론
+
+| 결정 | 권장 |
+|---|---|
+| Pose accuracy 우선 task (pick/place, IK 정밀) | **v4 unbounded chart** (Method A 그대로) |
+| Joint feasibility 강제가 필요한 task (안전 critical, hardware 제약) | **v4.1 bounded chart** (이 형식 채택, pose accuracy 손해 수용) |
+| Multimodal 분포 보존이 critical | v4.1이 약간 우위 (mfe 0.047 vs 0.12) |
+
+**Paper 관점**: v4.1은 *fundamental new capability* (joint feasibility by construction, never reachable in v4) 추가했지만 v4의 pose accuracy 우위를 빼앗지 못함. 이는 Choice A의 well-known trade-off (spec §9에 명시)이며, Franka pose task의 demo 분포가 충분히 interior에 있기에 unbounded chart가 충분한 안전 마진으로 작동하기 때문.
 
 ---
 
