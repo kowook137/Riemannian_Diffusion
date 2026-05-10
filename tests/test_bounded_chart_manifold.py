@@ -59,6 +59,15 @@ class _MockPoseManifold(EmbodimentPoseGraphManifold):
         self.q_lower = torch.full((n_q,), -2.0, dtype=torch.float64)
         self.q_upper = torch.full((n_q,), +2.0, dtype=torch.float64)
 
+    def joint_limits(self, device=None, dtype=torch.float32) -> tuple[Tensor, Tensor]:
+        return (self.q_lower.to(device=device, dtype=dtype),
+                self.q_upper.to(device=device, dtype=dtype))
+
+    def violates_limits(self, q: Tensor) -> Tensor:
+        lo = self.q_lower.to(device=q.device, dtype=q.dtype)
+        hi = self.q_upper.to(device=q.device, dtype=q.dtype)
+        return (q < lo).any(-1) | (q > hi).any(-1)
+
     def T_phi_Rp(self, q: Tensor, z: Tensor) -> tuple[Tensor, Tensor]:
         # Promote constants to q's device/dtype to keep autograd happy
         M = self.M.to(device=q.device, dtype=q.dtype)

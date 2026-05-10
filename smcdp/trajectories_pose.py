@@ -416,6 +416,16 @@ def traj_forward_grw_pose(
         δq = β · b^q · Δr   +   √(β · Δr) · ξ_q,    ξ_q ~ N(0, G^{-1})
 
     If `sde.limiting_q_mean` is None, drift is omitted (pure Brownian-on-M).
+
+    v4.1 chart-aware behavior (joint_limit_extension §7.1):
+        When `manifold` is a BoundedChartPoseManifold wrapper, the chart slot
+        of state stores `u` (not `q`), and `manifold.G_pose_chol`,
+        `manifold.make_x` automatically dispatch to the chart-aware overrides
+        — the noise covariance becomes `G_Q^A^{-1}` and retraction becomes
+        `Retr^Q_{(u,T)}(δu) = (u + δu, T_φ(ψ(u + δu), z_e))`.  No code change
+        needed in this function for v4.1; the only spec deviation is the
+        legacy Langevin drift path (used only if `forward_langevin_drift=True`),
+        which is not part of Method A and not validated under bounded chart.
     """
     manifold = sde.manifold
     schedule = sde.schedule
@@ -470,9 +480,20 @@ def _dsm_chart_target_pose(
     manifold: EmbodimentPoseGraphManifold,
     q_r: Tensor, q_0: Tensor, z: Tensor,
 ) -> Tensor:
-    """a*_pose(q_r, x_0) ∈ R^{n_q}  per extension.tex Eq. (35):
+    """a*_pose(q_r, x_0) ∈ R^{n_q}  per extension.tex Eq. (35) / joint_limit_extension §9:
 
-        a* = G_pose^{-1} · [ (q_0 − q_r) + J_pose^⊤ W · Log_SE(3)( T_φ(q_r)^{-1} T_φ(q_0) ) ]
+    v4 (unbounded chart, chart slot = q):
+        a*_pose = G_pose^{-1} · [(q_0 − q_r) + J_pose^⊤ W · Log_SE(3)(T_φ(q_r)^{-1} T_φ(q_0))]
+
+    v4.1 (bounded chart wrapper, chart slot = u — automatic via overrides):
+        a*_Q    = G_Q^A^{-1} · [(u_0 − u_r) + (J^Q)^⊤ W · Log_SE(3)(T_φ(ψ(u_r))^{-1} T_φ(ψ(u_0)))]
+
+    The function code is identical for both — when manifold is wrapped with
+    BoundedChartPoseManifold, `T_phi_Rp(u, z)` returns T_φ(ψ(u), z) (overridden),
+    `jacobian_pose(u, z)` returns J^Q = J_pose · D_ψ (overridden), and
+    `G_pose_chol(u, z)` returns chol(G_Q^A) (overridden), giving the v4.1
+    formula automatically.  See joint_limit_extension §9 for the structural
+    bias caveat (chart-Euclidean displacement near boundary).
     """
     R_r, p_r = manifold.T_phi_Rp(q_r, z)
     R_0, p_0 = manifold.T_phi_Rp(q_0, z)
@@ -635,52 +656,75 @@ def _smoothness_guidance_chart(
     manifold: EmbodimentPoseGraphManifold,
     alpha_vel: float,
     alpha_acc: float,
+    *,
+    chart_form: str = "q",
 ) -> Tensor:
     """Trajectory smoothness reward gradient (chart-form, Riemannian).
 
-    Mirrors position-only `_smoothness_guidance` with the same ½-prefixed penalty
-    convention (so closed-form chart gradients use small integer coefficients):
-        R_vel(τ) = −½ Σ_{h=0..H-1} ‖q_{h+1} − q_h‖²
-        R_acc(τ) = −½ Σ_{h=1..H-1} ‖q_{h+1} − 2 q_h + q_{h-1}‖²
+    Two penalty conventions, selected by ``chart_form`` (joint_limit_extension
+    v4.1 §12.3):
 
-        guidance_h = G_pose(q_h)^{-1} · ∂_q (α_v R_vel + α_a R_acc)
-                   = −G_pose^{-1} · (α_v ∂_q ½‖vel‖² + α_a ∂_q ½‖acc‖²)
+    chart_form="q" (DEFAULT, v4.1 spec):
+        Operates on the *physical* joint configuration q = ψ(u). Equivalent
+        to v4 when ψ is the identity (i.e., manifold not wrapped or wrapped
+        with IdentityChart):
+            R_vel(τ) = −½ Σ_{h=0..H-1} ‖ψ(u_{h+1}) − ψ(u_h)‖²
+            R_acc(τ) = −½ Σ_{h=1..H-1} ‖ψ(u_{h+1}) − 2 ψ(u_h) + ψ(u_{h-1})‖²
+        Rationale: physical interpretation, baseline parity (BC/DP report
+        q-chart smoothness), gradient auto-damping near boundary via D_ψ.
 
-    Closed-form chart gradients (no autograd) per timestep, then G^{-1}.
-    Returns chart-form (B, H+1, n_q).
+    chart_form="u" (alternative):
+        Operates on the chart coordinate u directly:
+            R_vel^u = −½ Σ ‖u_{h+1} − u_h‖²,  R_acc^u = −½ Σ ‖u_{h+1} − 2 u_h + u_{h-1}‖²
+        Use only when chart-Euclidean smoothness is explicitly desired.
+
+    Riemannian gradient: ∇_M R = G_pose(u)^{-1} · ∂_u R   (autograd through ψ).
+
+    Implementation: autograd is used uniformly to handle both forms with
+    chart-aware ψ chain rule.  Numerical equivalence to v4 closed-form
+    gradients holds when ψ = identity (i.e., manifold has no `chart` attr or
+    chart is IdentityChart).
     """
+    if chart_form not in ("q", "u"):
+        raise ValueError(f"chart_form must be 'q' or 'u', got {chart_form!r}")
     B, H1, _ = tau.shape
     n_q = manifold.n_q
     if alpha_vel == 0.0 and alpha_acc == 0.0:
         return torch.zeros(B, H1, n_q, device=tau.device, dtype=tau.dtype)
 
-    q = tau[..., :n_q]                                                          # (B, H+1, n_q)
+    chart_slot = tau[..., :n_q]                                                 # u (or q in v4 unwrapped)
     z = tau[..., n_q + 7:]
 
-    # ∂(½ Σ ‖q_{h+1}−q_h‖²)/∂q_h  closed-form (matches position-only convention)
-    grad_vel = torch.zeros_like(q)
-    grad_vel[:, 0, :]  = -(q[:, 1, :] - q[:, 0, :])
-    grad_vel[:, -1, :] =  (q[:, -1, :] - q[:, -2, :])
-    if H1 > 2:
-        grad_vel[:, 1:-1, :] = 2 * q[:, 1:-1, :] - q[:, 2:, :] - q[:, :-2, :]
+    # Resolve which "physical" coordinate to penalize.  When chart_form="q"
+    # we compose with ψ; when manifold lacks a `.chart` attribute (i.e., v4
+    # unwrapped where chart slot IS physical q), ψ is implicitly identity.
+    has_chart = hasattr(manifold, "chart")
 
-    # ∂(½ Σ ‖q_{h+1}−2q_h+q_{h-1}‖²)/∂q_h  via shifted differences (position-only style)
-    grad_acc = torch.zeros_like(q)
-    if H1 >= 3:
-        r = q[:, 2:, :] - 2 * q[:, 1:-1, :] + q[:, :-2, :]                       # (B, H-1, n_q)
-        grad_acc[:, 1:-1, :] += -2.0 * r
-        grad_acc[:, 0, :]    += +1.0 * r[:, 0, :]
-        grad_acc[:, -1, :]   += +1.0 * r[:, -1, :]
-        if H1 > 3:
-            grad_acc[:, 2:, :]  += +1.0 * r
-            grad_acc[:, :-2, :] += +1.0 * r
+    with torch.enable_grad():
+        u_leaf = chart_slot.detach().clone().requires_grad_(True)
+        if chart_form == "q" and has_chart:
+            # Apply ψ for v4.1 q-chart smoothness (autograd handles D_ψ chain rule)
+            q_phys = manifold.chart.psi(u_leaf)
+        else:
+            # chart_form="u" OR (chart_form="q" AND manifold unwrapped, ψ=identity)
+            q_phys = u_leaf
 
-    chart_grad = alpha_vel * grad_vel + alpha_acc * grad_acc                    # (B, H+1, n_q)
+        # R_vel = −½ Σ ‖q_{h+1}−q_h‖²  →  loss_vel = ½ Σ ‖q_{h+1}−q_h‖²
+        diff_vel = q_phys[:, 1:, :] - q_phys[:, :-1, :]                          # (B, H, n_q)
+        loss_vel = 0.5 * (diff_vel ** 2).sum()
+        if H1 >= 3:
+            diff_acc = q_phys[:, 2:, :] - 2 * q_phys[:, 1:-1, :] + q_phys[:, :-2, :]
+            loss_acc = 0.5 * (diff_acc ** 2).sum()
+        else:
+            loss_acc = q_phys.new_zeros(())
+
+        total = alpha_vel * loss_vel + alpha_acc * loss_acc                      # scalar
+        chart_grad = torch.autograd.grad(total, u_leaf)[0].detach()              # ∂R/∂u
 
     # Per-timestep G^{-1} (descent direction: −G^{-1} chart_grad = ∇_M R_smooth)
-    q_flat = q.reshape(B * H1, n_q)
+    chart_slot_flat = chart_slot.reshape(B * H1, n_q)
     z_flat = z.reshape(B * H1, -1)
-    L = manifold.G_pose_chol(q_flat, z_flat)
+    L = manifold.G_pose_chol(chart_slot_flat, z_flat)
     G_inv_grad = torch.cholesky_solve(
         chart_grad.reshape(B * H1, n_q, 1), L,
     ).squeeze(-1).reshape(B, H1, n_q)
@@ -718,6 +762,7 @@ def traj_reverse_grw_pose(
     goal_h_indices: Optional[list[int]] = None,                                 # default: [H]
     smoothness_alpha_vel: float = 0.0,
     smoothness_alpha_acc: float = 0.0,
+    smoothness_chart_form: str = "q",                                            # v4.1 §12.3 default
 ) -> Tensor:
     """Reverse-time GRW on M_φ^pose^{H+1}, chart form.
 
@@ -729,6 +774,15 @@ def traj_reverse_grw_pose(
         δq_h  = Δr · μ^q_h + √Δr · ξ_h^q,    ξ_h^q ~ N(0, G_pose^{-1})
         q_{h, k+1} = q_{h, k} + δq_h
         x_{h, k+1} = H_φ^pose(q_{h, k+1}, z_e).
+
+    v4.1 chart-aware behavior (joint_limit_extension §10):
+        When `manifold` is a BoundedChartPoseManifold wrapper, the variable
+        `q` in this function semantically holds `u` (the chart coordinate),
+        and `q_init` should be passed as `u_init = ψ⁻¹(q_init)` by the caller.
+        The retraction `manifold.make_x(u, z)` automatically computes
+        `H_φ^Q(u, z) = (ψ(u), T_φ(ψ(u), z), z)`, satisfying joint-limit
+        feasibility by construction (§13: viol(τ) = 0).  Smoothness reward
+        defaults to q-chart per spec §12.3 (override via `smoothness_chart_form`).
     """
     manifold: EmbodimentPoseGraphManifold = sde.manifold
     schedule = sde.schedule
@@ -823,11 +877,12 @@ def traj_reverse_grw_pose(
                 alpha_p=goal_alpha_p, alpha_R=goal_alpha_R,
                 h_indices=g_h,
             )
-        # Trajectory smoothness:  vel + acc penalties
+        # Trajectory smoothness:  vel + acc penalties (chart_form per v4.1 §12.3)
         if smoothness_alpha_vel > 0.0 or smoothness_alpha_acc > 0.0:
             s = s + _smoothness_guidance_chart(
                 x, manifold,
                 alpha_vel=smoothness_alpha_vel, alpha_acc=smoothness_alpha_acc,
+                chart_form=smoothness_chart_form,
             )
 
         # Limiting drift (chart, Anderson reverse formula).  Method A: when the
