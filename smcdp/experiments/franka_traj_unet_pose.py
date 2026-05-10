@@ -27,7 +27,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from smcdp.sde import LinearBetaSchedule
-from smcdp.manifolds_pose import Franka7DoFPose
+from smcdp.manifolds_pose import Franka7DoFPose, BoundedChartPoseManifold
+from smcdp.charts import make_chart_from_manifold
 from smcdp.franka.self_model_pose import (
     PoseResidualMLP, LearnedSelfModelFranka7DoFPose,
 )
@@ -137,6 +138,19 @@ def parse_args():
                    help="Fix 3: ε margin = epsilon_frac · (q_max − q_min) "
                         "before the joint-range box potential activates.  "
                         "Default 5%% of range (per doc).")
+    # joint_limit_extension v4.1 — bounded chart (joint-limit by construction)
+    p.add_argument("--bounded-chart", action="store_true",
+                   help="v4.1: enable TanhBoundedChart wrapper.  Chart slot "
+                        "stores u = psi^-1(q); psi(u) = q_mid + (q_range/2) tanh(u) "
+                        "auto-enforces q in (q_min, q_max).  Joint feasibility "
+                        "by construction (viol(tau) = 0).  See "
+                        "joint_limit_extension.tex Sec 3-5.  Pre-flight margin "
+                        "diagnostic must pass before deployment (1%%-tile >= 0.05).")
+    p.add_argument("--lambda-floor", type=float, default=1e-4,
+                   help="v4.1 Sec 5.1: Tikhonov floor on G_Q^A.  Less critical "
+                        "under Choice A (G_Q^A >= I globally) but retained for "
+                        "arithmetic underflow safety.  Active only when "
+                        "--bounded-chart is set.")
     p.add_argument("--cond-injection", type=str, default="channel",
                    choices=["global", "channel"])
     p.add_argument("--endpoint-weight", type=float, default=1.0)
@@ -219,6 +233,21 @@ def main():
     # set the attribute directly so all downstream G_pose_chol calls inherit it.
     arm.tikhonov_frac = float(args.tikhonov_frac)
     arm._ensure_chain(torch.zeros(1, 7, device=device))
+
+    # --- v4.1: optional bounded chart wrapper ---
+    # When enabled, all downstream code (demo gen, score net, DSM loss, GRW
+    # forward/reverse, eval) automatically operates in u-chart with
+    # G_Q^A / J^Q / ψ-retracted T_φ via overridden methods.  No further
+    # call-site changes; the chart slot of stored x is u (not q), and
+    # `arm.physical_q(x)` recovers q = ψ(u) when needed.
+    if args.bounded_chart:
+        arm = BoundedChartPoseManifold(
+            arm, make_chart_from_manifold(arm, bounded=True),
+            lambda_floor=float(args.lambda_floor),
+        )
+        print(f"[v4.1] bounded chart enabled (TanhBoundedChart, λ_floor={args.lambda_floor:.1e})")
+    else:
+        print(f"[v4.1] bounded chart disabled (v4 unbounded chart, q ∈ R^n_q)")
 
     # --- demo gen ---
     target_perturb_rad = args.target_perturb_deg * 3.14159265 / 180.0
