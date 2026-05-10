@@ -53,8 +53,10 @@
     \item \textbf{Adaptive Tikhonov with floor}: $\lambda_Q^A = c_\lambda \tr(G_Q^A)/n_q + \lambda_\text{floor}$ — the floor is structurally less critical under Choice A but retained for safety (\S\ref{sec:tikhonov}).
     \item \textbf{IK seed} obtained as $u^\text{init} = \psi^{-1}(q^\text{init})$ with safety clipping in $\eta$-space (initialization only, not sampling enforcement) (\S\ref{sec:ik-seed}).
     \item \textbf{Joint-limit feasibility} guaranteed in the open interval $(q_{\min}, q_{\max})$ by construction (\S\ref{sec:contribution-claim}).
-    \item \textbf{Reference-distribution push-forward warning}: $p_\text{ref}^u$ centered at $u^\text{init}$ may concentrate $q$-space mass near boundary if demo modes are boundary-adjacent; explicitly flagged (\S\ref{sec:reference-distribution}).
-    \item All other v4 elements preserved: drift-free Brownian forward, $\beta$-schedule, $SE(3)$ self-model with right-multiplicative residual, body-frame Jacobian, Varadhan DSM target, retraction sampling, multi-component guidance, quaternion implementation conventions.
+    \item \textbf{Push-forward distortion --- mandatory pre-flight diagnostic}: 3-stage compounding effect (training warp $\to$ DSM target inflation $\to$ sampling asymmetry) characterized; demo-margin decision rule (1\%-tile $\geq 0.05$) introduced as deployment precondition (\S\ref{sec:reference-distribution}).
+    \item \textbf{Smoothness reward default switched to $q$-chart}: $\| \psi(u_{h+1}) - \psi(u_h) \|^2$ replaces $\| u_{h+1} - u_h \|^2$ as default for physical interpretability and baseline parity. $u$-chart form retained as documented alternative.
+    \item \textbf{Varadhan-target chart-Euclidean bias acknowledged}: $u_0 - u_r$ in $a^*_Q$ is structurally biased near chart boundary; this trade-off is intrinsic to Choice A (cannot coexist with global identity floor) and is reported as a known limitation rather than concealed (\S\ref{sec:dsm}, \S\ref{sec:contribution-claim}).
+    \item All other v4 elements preserved: drift-free Brownian forward, $\beta$-schedule, $SE(3)$ self-model with right-multiplicative residual, body-frame Jacobian, Varadhan DSM target structure, retraction sampling, multi-component guidance, quaternion implementation conventions.
 \end{itemize}
 
 \paragraph{Notation conventions.} Throughout this document:
@@ -324,6 +326,14 @@ Closed form (using $(J_H^{Q,A})^\top \widetilde W J_H^{Q,A} = G_Q^A$):
 
 \paragraph{Loss weighting.} Default $w(r) = \tau_\text{brown}(r)$.
 
+\paragraph{Varadhan approximation bias near chart boundary (limitation).} The chart-Euclidean displacement $u_0 - u_r$ in $a^*_Q$ assumes a uniform inner product on the first ambient block ($\widetilde W$'s first block $= I_{n_q}$). This is structurally consistent with Choice A and gives the identity floor $G_Q^A \succeq I_{n_q}$ globally. However, the Varadhan asymptotic
+\[
+\nabla_\Mset \log p_{r|0}(x_r \mid x_0) \approx \tau_\text{brown}(r)^{-1}\,\Log_{\Mset, x_r}(x_0)
+\]
+is exact in the limit only when $G_Q^A$ is approximately constant between $u_r$ and $u_0$. Because $D_\psi(u) \to 0$ near the chart boundary while $D_\psi(0) = q_\text{range}/2$ at the chart center, the second term $D_\psi^\top \Jpose^\top W \Jpose D_\psi$ in $G_Q^A$ varies by 2--3 decades across the chart range when $W_p, W_R$ are large (default $W_p = 400$). The chart-Euclidean target $u_0 - u_r$ thus carries a position-dependent systematic bias for boundary-adjacent samples (i.e., trajectories with $\|u_h\|_\infty \gtrsim 2$).
+
+\textbf{Trade-off characterization.} Replacing the first block of $\widetilde W$ with a position-dependent weight $D_\psi(u)^2$ would make the chart inner product equivalent to physical $q$-space Euclidean and remove this bias, but would also restore boundary degeneracy ($G_Q^A \to 0$ as $D_\psi \to 0$), which is precisely what Choice A was constructed to avoid. The two desirable properties — (i) physical Euclidean equivalence on the chart slot and (ii) global identity floor on $G_Q^A$ — cannot be simultaneously enforced under any first-block weighting. We deliberately choose (ii) for numerical robustness, accepting (i)'s violation as a structural limitation. Empirical validation strategy: when demo modes satisfy the margin condition in \S\ref{sec:reference-distribution}, the bias is bounded; otherwise v4 (unbounded chart) should be preferred. See \S\ref{sec:contribution-claim} for the empirical re-validation list.
+
 \section{Sampling: retraction-based geodesic random walk}
 \label{sec:sampling}
 
@@ -368,7 +378,24 @@ where $u^\text{init} = \psi^{-1}(q^\text{init})$ (\S\ref{sec:ik-seed}).
 \begin{equation}
 p_\text{ref}^q(q) = p_\text{ref}^u(\psi^{-1}(q)) \cdot \bigl| \det D_\psi^{-1}(\psi^{-1}(q)) \bigr|.
 \end{equation}
-The Jacobian factor $|\det D_\psi^{-1}|$ diverges as $q$ approaches $q_{\min}$ or $q_{\max}$, so $p_\text{ref}^q$ may concentrate non-uniform mass near boundary. \textbf{Practical implication}: if demo modes lie near joint boundary (i.e., $q^\text{mode} \approx q_{\max} - \delta$ for small $\delta$), the bounded-chart sampler may exhibit altered mode capture compared to unbounded chart. Pre-flight check: inspect demo distribution of $\min_i (q_i - q_{\min, i})$ and $\min_i (q_{\max, i} - q_i)$; if these are large compared to $q_{\text{range}, i}/2$, push-forward distortion is negligible.
+The Jacobian factor $|\det D_\psi^{-1}|$ diverges as $q$ approaches $q_{\min}$ or $q_{\max}$, so $p_\text{ref}^q$ may concentrate non-uniform mass near boundary. The distortion compounds across three stages:
+\begin{enumerate}[noitemsep]
+  \item \textit{Training distribution warp}: a $q$-space margin $\delta = (1-|\eta|)\, q_\text{range}/2$ produces $u = \tanh^{-1}(\eta)$, so $q$-margin of $5\%, 1\%, 0.1\%$ maps to $\|u\|$ of $\approx 1.47, 2.30, 3.45$. Boundary-adjacent demos dominate the score net's effective input range.
+  \item \textit{DSM target inflation}: for $u_0 = 3, u_r = 1$, the chart-Euclidean displacement $u_0 - u_r = 2$ corresponds to $\psi(u_0) - \psi(u_r) \approx 0.23 \cdot q_\text{range}/2$, a $\sim 9\times$ amplification of $q$-displacement into the score target.
+  \item \textit{Sampling asymmetry}: with $\sigma_u(K) = \sqrt{\tau_\text{brown}(K)} \approx 1.41$, an initialization at $u^\text{init} = 2$ covers $u \in [0.6, 3.4]$ and pushes nearly all $q$-mass to one side of $\psi(u^\text{init})$, breaking multimodal coverage.
+\end{enumerate}
+
+\paragraph{Pre-flight margin diagnostic (mandatory before bounded-chart deployment).} For demo set $\D = \{q_h^{(i)}\}$, define per-sample relative margin
+\begin{equation}
+m^{(i)}_h = \min_i \min\!\left( \frac{q_{h, i}^{(i)} - q_{\min, i}}{q_{\text{range}, i}},\ \frac{q_{\max, i} - q_{h, i}^{(i)}}{q_{\text{range}, i}} \right) \in (0, 0.5].
+\end{equation}
+Compute the empirical 1\%-tile and 5\%-tile of $\{m^{(i)}_h\}$ across all demo timesteps and trajectories. \textbf{Decision rule}:
+\begin{itemize}[noitemsep]
+  \item $\text{1\%-tile} \geq 0.05$ (5\% margin) and $\text{5\%-tile} \geq 0.10$: \textbf{safe} — push-forward distortion negligible. Proceed with bounded chart.
+  \item $0.01 \leq \text{1\%-tile} < 0.05$: \textbf{caution} — empirical mode-capture and OOD validation required before claiming joint-feasibility benefit. Compare bounded vs.\ unbounded mode capture explicitly.
+  \item $\text{1\%-tile} < 0.01$: \textbf{abort bounded chart} — demo distribution is incompatible with the assumed margin condition; v4 (unbounded chart with joint-violation reported as a metric) is the correct setting.
+\end{itemize}
+This check is a precondition for the joint-feasibility-by-construction claim (\S\ref{sec:contribution-claim}); deploying bounded chart on a demo set that fails the rule produces structurally biased training distributions and invalidates the multimodal coverage guarantee.
 
 \subsection{IK seed selection}
 \label{sec:ik-seed}
@@ -452,12 +479,23 @@ e_\text{goal}(u_H, z_e) = \Log_{\SE(3)}\!\bigl(\Tphi(\psi(u_H), z_e)^{-1} T_\tex
 R_\text{goal} = -(\alpha_p^g \| e_\rho^g \|^2 + \alpha_R^g \| e_\omega^g \|^2).
 \end{equation}
 
-\paragraph{Smoothness in $u$-chart.}
+\paragraph{Smoothness in $q$-chart (default).}
 \begin{equation}
-R_\text{vel} = -\sum_{h=0}^{H-1} \| u_{h+1} - u_h \|^2, \qquad R_\text{acc} = -\sum_{h=1}^{H-1} \| u_{h+1} - 2 u_h + u_{h-1} \|^2.
+\boxed{ R_\text{vel} = -\sum_{h=0}^{H-1} \| \psi(u_{h+1}) - \psi(u_h) \|^2, \qquad R_\text{acc} = -\sum_{h=1}^{H-1} \| \psi(u_{h+1}) - 2 \psi(u_h) + \psi(u_{h-1}) \|^2. }
 \end{equation}
+Gradient via autograd through $\psi$. The $q$-chart form is the default because:
+\begin{itemize}[noitemsep]
+  \item \textit{Physical interpretation}: $q$ is the physical joint configuration; smoothness in $q$ corresponds to smooth motor commands.
+  \item \textit{Baseline parity}: BC and DP baselines operate in $q$-space, so cross-method smoothness comparison is consistent only in $q$-chart.
+  \item \textit{Boundary auto-damping}: $\nabla_{u_h} \| \psi(u_{h+1}) - \psi(u_h) \|^2$ contains $D_\psi(u_h)$ and $D_\psi(u_{h+1})$ factors, so smoothness gradient automatically vanishes near the chart boundary. This complements the $u$-chart structure of the score: large $u$-jumps near boundary (corresponding to small physical motion) carry small smoothness penalty, consistent with their small physical effect.
+  \item \textit{Cross-method fairness}: smoothness as an evaluation metric must be reported in $q$-chart to compare bounded-chart Method A against unbounded baselines without chart-induced bias.
+\end{itemize}
 
-\paragraph{Smoothness in $u$-chart vs $q$-chart.} The chart-Euclidean smoothness $\| u_{h+1} - u_h \|^2$ does not equal physical-joint smoothness $\| q_{h+1} - q_h \|^2$ in general. Near joint center ($u \approx 0$), $D_\psi \approx \mathrm{diag}(q_\text{range}/2)$ is constant and the two are approximately proportional. Near boundary, $D_\psi \to 0$ → small $\|q_{h+1} - q_h\|$ even for large $\|u_{h+1} - u_h\|$, so $u$-chart smoothness allows large $u$-jumps near boundary but corresponding $q$-jumps are damped. For most manipulation tasks where demos stay away from joint limits, this distinction is negligible. For tasks where physical-joint smoothness is critical, alternative form $R_\text{vel}^q = -\sum \| \psi(u_{h+1}) - \psi(u_h) \|^2$ may be used (autograd through $\psi$).
+\paragraph{Smoothness in $u$-chart (alternative).}
+\begin{equation}
+R_\text{vel}^u = -\sum_{h=0}^{H-1} \| u_{h+1} - u_h \|^2, \qquad R_\text{acc}^u = -\sum_{h=1}^{H-1} \| u_{h+1} - 2 u_h + u_{h-1} \|^2.
+\end{equation}
+$u$-chart smoothness does not equal physical-joint smoothness: near joint center ($u \approx 0$), $D_\psi \approx q_\text{range}/2 \cdot I$ is approximately constant and the two are proportional, but near boundary, $D_\psi \to 0$ allows large $\|u_{h+1} - u_h\|$ for vanishing $\|q_{h+1} - q_h\|$. This can produce trajectories that are smooth in physical joint space but ``jerky'' in $u$-coordinates --- harmless physically but inconsistent with the chart-Euclidean noise process used in sampling. Use $R_\text{vel}^u$ only when chart-Euclidean smoothness is explicitly desired (e.g., to penalize the score net's effective $u$-input range).
 
 \subsection{Tangent verification (trajectory-level)}
 $J_g^Q(x_h, z_e) \cdot [J_H^{Q,A}(u_h, z_e)\, s_{\text{guided}, h}^u] = 0$.
@@ -555,16 +593,21 @@ This is a strict guarantee in the open interval, by construction of $\psi$. Comb
 
 \paragraph{Stationary distribution (unchanged from v4).} $u \in \R^{n_q}$ is non-compact, forward pure Brownian → no stationary probability measure. Finite-time noising on $r \in [0, K]$ retained. The bounded chart constrains \textbf{physical} $q$-support, not the \textbf{computational} $u$-support; this is acceptable since the sampler's output is judged on $q$ and $T$.
 
-\paragraph{Push-forward distortion.} The $u$-chart Gaussian reference distribution may concentrate mass near joint boundary in $q$-space if demo modes are boundary-adjacent. Empirical pre-flight: examine demo joint margin distribution.
+\paragraph{Push-forward distortion (mandatory pre-flight).} The $u$-chart Gaussian reference distribution may concentrate mass near joint boundary in $q$-space if demo modes are boundary-adjacent. The distortion compounds in three stages (training warp $\to$ DSM target inflation $\to$ sampling asymmetry; see \S\ref{sec:reference-distribution}). \textbf{Decision rule}: compute the 1\%-tile and 5\%-tile of the demo relative-margin statistic; bounded chart is safe only when 1\%-tile $\geq 0.05$. Margin between $0.01$ and $0.05$ requires explicit empirical mode-capture comparison; below $0.01$ the bounded chart should not be deployed.
 
-\paragraph{Empirical re-validation required.} The "stationary issue is bypassed empirically" claim from v4 was validated on unbounded chart. Under bounded chart, the validation must be repeated:
+\paragraph{Varadhan bias near chart boundary (structural).} The DSM chart-Euclidean displacement $u_0 - u_r$ is exact under uniform $G_Q^A$ but acquires a position-dependent systematic bias when $D_\psi$ varies across the trajectory range (see \S\ref{sec:dsm}). This bias cannot be eliminated under Choice A without sacrificing the global identity floor $G_Q^A \succeq I$; it is a structural trade-off of the bounded-chart formulation, not a numerical artifact. Empirical impact is bounded by the margin condition above; we report it as a known limitation and validate via $\|u\|_\infty$ percentiles and DSM loss-curve symmetry.
+
+\paragraph{Empirical re-validation required.} The "stationary issue is bypassed empirically" claim from v4 was validated on unbounded chart. Under bounded chart, the validation must be repeated, with additional diagnostics for the structural bias:
 \begin{itemize}[noitemsep]
-    \item DSM loss convergence (potential degeneracy from $D_\psi \to 0$ in $\Jpose^Q$);
-    \item Pose success at standard $(\rho_p, \rho_R)$;
-    \item Mode capture (with caveat above);
+    \item \textbf{Pre-flight}: demo relative-margin 1\%-tile / 5\%-tile (decision rule, \S\ref{sec:reference-distribution}); abort if 1\%-tile $< 0.01$;
+    \item DSM loss convergence and \textbf{loss-curve symmetry across $\|u\|_\infty$ strata} (boundary-adjacent samples vs.\ center) --- asymmetry indicates Varadhan bias becoming load-bearing;
+    \item Pose success at standard $(\rho_p, \rho_R)$, reported per ID/OOD strata;
+    \item \textbf{Mode capture in $q$-chart} (push-forward-corrected): compare bounded vs.\ unbounded explicitly; mode-capture degradation $> 5$pp under matched margin condition is a failure signal;
     \item OOD generalization on $z_e$;
-    \item $\|u\|_\infty$ distribution (saturation diagnostic);
-    \item $\min \lambda_{\min}(G_Q^A)$ and $\max \mathrm{cond}(G_Q^A)$ (numerical diagnostic).
+    \item $\|u\|_\infty$ distribution percentiles (saturation diagnostic): 99\%-tile $> 3$ indicates the chart is being driven into the saturation regime where $D_\psi$ vanishes;
+    \item $\min_h \lambda_{\min}(G_Q^A(u_h))$ and $\max_h \mathrm{cond}(G_Q^A(u_h))$ (numerical diagnostic, expected $\geq 1$ and bounded under Choice A);
+    \item Joint margin distribution percentiles (auxiliary): low margin with $\text{viol} = 0$ confirms chart-effective range is being exercised --- but not a failure signal by itself;
+    \item Smoothness $\text{vel}^q$ and $\text{vel}^u$ both reported, for cross-chart consistency check.
 \end{itemize}
 
 \paragraph{Core contribution (refined).} The contribution is the $z_e$-conditioned self-model manifold ${\Mpose}^Q(z_e)$ on $\SE(3)$ with bounded chart parameterization, induced task-aware metric $G_Q^A$ (Choice A), tangent-lifted score $J_H^{Q,A} s^u$, product-manifold Riemannian guidance, and joint-limit feasibility by construction. None of these depend on the choice of forward SDE structure (drift vs.\ pure Brownian). Pure Brownian remains the simplest forward consistent with these contributions.
@@ -659,7 +702,7 @@ Joint feasibility & Soft (via demo distribution + bounded $K$); reported as eval
 \hline
 Self-model domain & Implicit & Explicit Stage 1 assumption: trained on $q \in [q_{\min}, q_{\max}]$ \\
 \hline
-Smoothness reward & $\| q_{h+1} - q_h \|^2$ in $q$-chart & $\| u_{h+1} - u_h \|^2$ in $u$-chart (default); $\| \psi(u_{h+1}) - \psi(u_h) \|^2$ alternative \\
+Smoothness reward & $\| q_{h+1} - q_h \|^2$ in $q$-chart & $\| \psi(u_{h+1}) - \psi(u_h) \|^2$ in $q$-chart (default, baseline parity); $\| u_{h+1} - u_h \|^2$ alternative (chart-Euclidean) \\
 \hline
 Stationary distribution & None ($q \in \R^{n_q}$ non-compact) & None ($u \in \R^{n_q}$ non-compact) — \textbf{unchanged}; physical $q$-support is bounded but computational chart is not \\
 \hline
