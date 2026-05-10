@@ -13,7 +13,8 @@ import torch
 import pybullet_data
 
 from smcdp.sde import LinearBetaSchedule
-from smcdp.manifolds_pose import Franka7DoFPose
+from smcdp.manifolds_pose import Franka7DoFPose, BoundedChartPoseManifold
+from smcdp.charts import make_chart_from_manifold
 from smcdp.franka.self_model_pose import (PoseResidualMLP, LearnedSelfModelFranka7DoFPose)
 from smcdp.franka.demo_gen_pose import FrankaBimodalReachingDemoPose
 from smcdp.trajectories_pose import (
@@ -63,6 +64,16 @@ def main():
                                            sigma_R=a["sigma_R"], tool_z_max=a["z_max"])
     arm.tikhonov_frac = float(a.get("tikhonov_frac", 0.0))
     arm._ensure_chain(torch.zeros(1, 7, device=device))
+
+    # v4.1: reconstruct bounded-chart wrapper if ckpt was trained with one.
+    # Args saved via vars(args), so flags propagate transparently.
+    if a.get("bounded_chart", False):
+        arm = BoundedChartPoseManifold(
+            arm, make_chart_from_manifold(arm, bounded=True),
+            lambda_floor=float(a.get("lambda_floor", 1e-4)),
+        )
+        print(f"[v4.1] bounded chart wrapper reconstructed "
+              f"(TanhBoundedChart, lambda_floor={a.get('lambda_floor', 1e-4):.1e})")
 
     # Score net
     schedule = LinearBetaSchedule(beta_0=a["beta_0"], beta_f=a["beta_f"], tf=1.0)

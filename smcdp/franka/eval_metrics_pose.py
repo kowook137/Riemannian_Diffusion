@@ -118,12 +118,26 @@ def compute_pose_metrics(
         "invalid_quat_rate": (q_norm_err > quat_tol).float().mean().item(),
     }
 
-    # ---- 4. Multimodality ----
+    # ---- chart-aware physical-q recovery (joint_limit_extension v4.1) ----
+    # When `arm` is a BoundedChartPoseManifold, samples[..., :n_q] stores u
+    # (chart coord), not physical q.  For metrics that require physical q
+    # (mode capture, W_1^q, joint feasibility), apply ψ via arm.physical_q.
+    # For unwrapped manifold (v4) or IdentityChart, physical_q is identity.
+    if hasattr(arm, "chart"):
+        q_phys = arm.physical_q(samples)                            # (B, H+1, n_q)
+        q_phys_demo = arm.physical_q(x_demo) if x_demo is not None else None
+        is_bounded = True
+    else:
+        q_phys = samples[..., :n_q]                                 # v4: chart slot IS q
+        q_phys_demo = x_demo[..., :n_q] if x_demo is not None else None
+        is_bounded = False
+
+    # ---- 4. Multimodality (in physical q-chart for fair v4↔v4.1 comparison) ----
     h_mid = H1 // 2
-    q1_mid_gen = samples[:, h_mid, 0]                              # 1st joint at trajectory midpoint
+    q1_mid_gen = q_phys[:, h_mid, 0]                                # 1st joint at trajectory midpoint
     frac_A_gen = (q1_mid_gen > 0).float().mean().item()
-    if x_demo is not None:
-        q1_mid_demo = x_demo[:, h_mid, 0]
+    if q_phys_demo is not None:
+        q1_mid_demo = q_phys_demo[:, h_mid, 0]
         frac_A_demo = (q1_mid_demo > 0).float().mean().item()
     else:
         frac_A_demo = 0.5                                          # designed bimodal balance
@@ -135,13 +149,13 @@ def compute_pose_metrics(
         "frac_between": (q1_mid_gen.abs() < 0.05).float().mean().item(),
     }
 
-    # ---- 5. Sliced W_1 in joint-trajectory space ----
-    if x_demo is not None and B >= 8:
-        q_gen_flat  = samples[..., :n_q].reshape(B, H1 * n_q)      # (B, H+1, n_q) → flat
-        q_demo_flat = x_demo[..., :n_q].reshape(x_demo.shape[0], H1 * n_q)
-        m = min(B, x_demo.shape[0])
+    # ---- 5. Sliced W_1 in physical joint-trajectory space (v4.1 §13 caveat) ----
+    if q_phys_demo is not None and B >= 8:
+        q_gen_flat  = q_phys.reshape(B, H1 * n_q)
+        q_demo_flat = q_phys_demo.reshape(q_phys_demo.shape[0], H1 * n_q)
+        m = min(B, q_phys_demo.shape[0])
         ig = torch.randperm(B, device=device)[:m]
-        id_ = torch.randperm(x_demo.shape[0], device=device)[:m]
+        id_ = torch.randperm(q_phys_demo.shape[0], device=device)[:m]
         q_gen_flat = q_gen_flat[ig]
         q_demo_flat = q_demo_flat[id_]
         dirs = torch.randn(n_w1_dirs, q_gen_flat.shape[-1], device=device, dtype=dtype)
@@ -156,14 +170,26 @@ def compute_pose_metrics(
         multimodal["W1_q"] = float("nan")
 
     # ---- 6. Trajectory smoothness ----
-    q_traj = samples[..., :n_q]                                    # (B, H+1, n_q)
-    q_diff = q_traj[:, 1:, :] - q_traj[:, :-1, :]                  # (B, H, n_q)
+    # Spec v4.1 §13 requests both u-chart and q-chart smoothness when bounded.
+    chart_slot = samples[..., :n_q]                                # u (bounded) or q (unwrapped)
+    # Physical q-chart smoothness (default, baseline parity per v4.1 §12.3)
+    q_diff = q_phys[:, 1:, :] - q_phys[:, :-1, :]
     E_vel  = q_diff.pow(2).sum(-1).mean().item()
     if H1 > 2:
-        q_acc  = q_traj[:, 2:, :] - 2*q_traj[:, 1:-1, :] + q_traj[:, :-2, :]
+        q_acc  = q_phys[:, 2:, :] - 2 * q_phys[:, 1:-1, :] + q_phys[:, :-2, :]
         E_acc  = q_acc.pow(2).sum(-1).mean().item()
     else:
         E_acc = 0.0
+    smoothness = {"E_vel": E_vel, "E_acc": E_acc}
+    # u-chart smoothness diagnostic (only meaningful for bounded chart)
+    if is_bounded:
+        u_diff = chart_slot[:, 1:, :] - chart_slot[:, :-1, :]
+        smoothness["E_vel_u"] = u_diff.pow(2).sum(-1).mean().item()
+        if H1 > 2:
+            u_acc = chart_slot[:, 2:, :] - 2 * chart_slot[:, 1:-1, :] + chart_slot[:, :-2, :]
+            smoothness["E_acc_u"] = u_acc.pow(2).sum(-1).mean().item()
+        else:
+            smoothness["E_acc_u"] = 0.0
     p_traj = samples[..., n_q + 4 : n_q + 7]
     p_diff = p_traj[:, 1:, :] - p_traj[:, :-1, :]
     E_p_dot = p_diff.pow(2).sum(-1).mean().item()
@@ -171,26 +197,39 @@ def compute_pose_metrics(
     R_inv_R_next = R_traj[:, :-1, :, :].transpose(-1, -2) @ R_traj[:, 1:, :, :]
     omega = log_SO3(R_inv_R_next.reshape(-1, 3, 3)).reshape(B, H1 - 1, 3)
     E_omega = omega.pow(2).sum(-1).mean().item()
-    smoothness = {"E_vel": E_vel, "E_acc": E_acc, "E_p_dot": E_p_dot, "E_omega": E_omega}
+    smoothness["E_p_dot"] = E_p_dot
+    smoothness["E_omega"] = E_omega
 
-    # ---- 7. Physical feasibility ----
+    # ---- 7. Physical feasibility (v4.1 §13: viol = 0 by construction when bounded) ----
     if hasattr(arm, "joint_limits"):
         q_lo, q_hi = arm.joint_limits(device=device, dtype=dtype)  # (n_q,) each
-        viol_per_traj = ((q_traj < q_lo) | (q_traj > q_hi)).any(-1).any(-1)  # (B,)
+        viol_per_traj = ((q_phys < q_lo) | (q_phys > q_hi)).any(-1).any(-1)  # (B,)
         joint_viol_rate = viol_per_traj.float().mean().item()
-        excess_lo = (q_lo - q_traj).clamp(min=0)
-        excess_hi = (q_traj - q_hi).clamp(min=0)
+        excess_lo = (q_lo - q_phys).clamp(min=0)
+        excess_hi = (q_phys - q_hi).clamp(min=0)
         e_jl = (excess_lo.pow(2) + excess_hi.pow(2)).sum(-1).mean().item()
-        m_lo = (q_traj - q_lo) / (q_hi - q_lo).clamp(min=1e-6)
-        m_hi = (q_hi - q_traj) / (q_hi - q_lo).clamp(min=1e-6)
+        m_lo = (q_phys - q_lo) / (q_hi - q_lo).clamp(min=1e-6)
+        m_hi = (q_hi - q_phys) / (q_hi - q_lo).clamp(min=1e-6)
         m_min = torch.minimum(m_lo, m_hi).min().item()
         physical = {
             "joint_viol_rate": joint_viol_rate,
             "e_jl": e_jl,
             "joint_margin_min": m_min,
         }
+        # v4.1 §13 saturation diagnostic: ||u||_inf percentiles, only for bounded
+        if is_bounded:
+            u_inf = chart_slot.abs().reshape(-1, n_q).max(-1).values  # (B*H1,)
+            sorted_u = u_inf.sort().values
+            n = sorted_u.numel()
+            def pct(p):
+                idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+                return sorted_u[idx].item()
+            physical["u_inf_p50"] = pct(0.50)
+            physical["u_inf_p90"] = pct(0.90)
+            physical["u_inf_p99"] = pct(0.99)
     else:
-        physical = {"joint_viol_rate": float("nan"), "e_jl": float("nan"), "joint_margin_min": float("nan")}
+        physical = {"joint_viol_rate": float("nan"), "e_jl": float("nan"),
+                     "joint_margin_min": float("nan")}
 
     return {
         **primary,
