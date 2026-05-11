@@ -1404,6 +1404,7 @@ def traj_reverse_ou_chart_pose(
     eps: float = 2e-4,
     device=None, dtype=torch.float32,
     score_postprocess=None,
+    integrator: str = "euler",                                                  # "euler" (default) | "exp_int" (exponential integrator on OU mirror)
     # ---- reward guidance (spec §11.4 + §12) ----
     T_start_Rp: Optional[tuple[Tensor, Tensor]] = None,
     start_alpha_p: float = 0.0,
@@ -1511,14 +1512,40 @@ def traj_reverse_ou_chart_pose(
         # ---- Ḡ_Q^{-1} (score + guidance) ----
         gbar_inv_s = sde.gbar_inv_apply(s)                                      # (B, H+1, n_q)
 
-        # ---- Forward-positive-dr drift:  ½ β u + β · Ḡ_Q^{-1} · s_total ----
-        drift = 0.5 * beta_k * u + beta_k * gbar_inv_s                          # (B, H+1, n_q)
-
-        # ---- Noise:  √(β · dr) · Ḡ_Q^{-1/2} · ξ ----
         xi = torch.randn(B, H1, n_q, device=device, dtype=dtype)
-        noise = (beta_k * dr).sqrt() * sde.gbar_inv_sqrt_apply(xi)              # (B, H+1, n_q)
 
-        u = u + drift * dr + noise
+        if integrator == "euler":
+            # Euler–Maruyama (spec §11.3.4):
+            #   u_{k+1} = u_k + (½ β u + β · Ḡ⁻¹ · s_total) · dr + √(β · dr) · Ḡ⁻¹/² · ξ
+            drift = 0.5 * beta_k * u + beta_k * gbar_inv_s                      # (B, H+1, n_q)
+            noise = (beta_k * dr).sqrt() * sde.gbar_inv_sqrt_apply(xi)
+            u = u + drift * dr + noise
+        elif integrator == "exp_int":
+            # Stochastic exponential integrator on the OU mirror term:
+            #   The linear SDE  du = (a u + b) dr + c dB   with a = β/2,  b = β · Ḡ⁻¹ · s,
+            #   c · c^T = β · Ḡ⁻¹  has the exact strong solution (constant a, b, c on a step):
+            #       u(r+dr) = e^{a dr} u(r) + (e^{a dr}-1)/a · b + ∫_0^{dr} e^{a(dr-s)} c dB_s
+            #   The stochastic integral is Gaussian with variance
+            #       c c^T · (e^{2a dr} - 1)/(2a) = Ḡ⁻¹ · (e^{β dr} - 1)
+            #   so noise = √(e^{β dr} - 1) · Ḡ⁻¹/² · ξ.
+            #
+            # Matches Euler to O(dr) at small β·dr; cleanly handles stiffness of the OU
+            # mirror (a = β/2 ≈ β_max/2 ≈ 10 at end of schedule) — important for
+            # endpoint precision (see n_steps sweep evidence: pos err 5.73→4.20 cm
+            # going from 200→1000 Euler steps).
+            phi_dr = (0.5 * beta_k * dr).exp()                                  # e^{β dr / 2}  (B, 1, 1)
+            phi_full = (beta_k * dr).exp()                                      # e^{β dr}      (B, 1, 1)
+            # u_homog = e^{β dr / 2} · u
+            u_homog = phi_dr * u
+            # source = (e^{β dr / 2} - 1) · 2 · Ḡ⁻¹ · s_total
+            # (since (e^{a dr} - 1)/a · b  with a = β/2, b = β · Ḡ⁻¹ s  collapses to 2 (e^{β dr/2}-1) Ḡ⁻¹ s)
+            source = 2.0 * (phi_dr - 1.0) * gbar_inv_s
+            # noise: σ_noise = √(e^{β dr} - 1) · Ḡ⁻¹/² · ξ
+            sigma_noise = (phi_full - 1.0).clamp(min=0.0).sqrt()                # (B, 1, 1)
+            noise = sigma_noise * sde.gbar_inv_sqrt_apply(xi)
+            u = u_homog + source + noise
+        else:
+            raise ValueError(f"unknown integrator '{integrator}'; expected 'euler' or 'exp_int'")
 
         # ---- Graph retract:  x = (u, T̃_φ(ψ(u), z), z) ----
         x = manifold.make_x(

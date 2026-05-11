@@ -40,6 +40,12 @@ def parse_args():
     p.add_argument("--out-name", type=str, default="eval_metrics_full.json")
     p.add_argument("--n-sample-steps", type=int, default=None,
                    help="Override ckpt's n_sample_steps. None → use ckpt value.")
+    p.add_argument("--integrator", type=str, default="euler",
+                   choices=["euler", "exp_int"],
+                   help="v5.1 reverse SDE integrator: 'euler' (default) or "
+                        "'exp_int' (stochastic exponential integrator on the "
+                        "OU mirror — same step count, higher accuracy for the "
+                        "stiff ½β u term).")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -166,6 +172,7 @@ def main():
                 sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
                 n_steps=n_sample_steps_eff, goal_cond=goal_cond, z_e=z_e,
                 eps=a["eps"], device=device, dtype=dtype,
+                integrator=args.integrator,
                 T_start_Rp=T_start_Rp,
                 start_alpha_p=start_ap, start_alpha_R=start_aR,
                 start_h_indices=[0],
