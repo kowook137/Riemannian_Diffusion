@@ -109,6 +109,10 @@ def parse_args():
                    choices=["global", "channel"],
                    help="DP variant: 'global' (canonical Chi23) or 'channel' (DP-A).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save-every", type=int, default=0,
+                   help="If > 0, save an intermediate ckpt every N steps under "
+                        "<out_dir>/step_{step:06d}/ckpt.pt. Used for plateau "
+                        "diagnostics (compare succ@step curve to detect overfitting).")
     p.add_argument("--out-dir", type=str, default=None,
                    help="Default: outputs/franka_baseline_pose_{baseline}{_cond_injection}")
     return p.parse_args()
@@ -292,6 +296,23 @@ def main():
         losses.append(loss.item())
         if step % 200 == 0:
             pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        # Plateau diagnostic: periodic checkpoint save
+        if (args.save_every > 0
+                and (step + 1) % args.save_every == 0
+                and (step + 1) < args.steps):
+            sub = out_dir / f"step_{step + 1:06d}"
+            sub.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "args": vars(args),
+                "stage1_pose_args": s1,
+                "step": step + 1,
+                "model_state": model.state_dict(),
+                "ema_state": ema_state,
+                "scheduler_config": (
+                    dict(scheduler.config) if scheduler is not None else None
+                ),
+            }, sub / "ckpt.pt")
 
     # ---- Save ----
     torch.save({

@@ -44,17 +44,22 @@ URDF = f"{pybullet_data.getDataPath()}/franka_panda/panda.urdf"
 
 
 # Sweep grid (diagnostic_plan.md §4 first sweep)
+# Convention: alpha-scalars are multipliers over the spec's metric weights
+# W_p = 1/σ_p² and W_R = 1/σ_R² (extension.tex §1.2).  i.e. for a config
+# with α_g = 1.0:  goal_alpha_p = 1.0·W_p,  goal_alpha_R = 1.0·W_R.
+# This matches the natural-gradient `G^{-1} ∇R` magnitude with the score
+# scale (otherwise guidance vanishes near the chart boundary where D_ψ→0).
 GRID = [
     # (name, alpha_g, alpha_s, alpha_u, note)
     ("G0", 0.0, 0.0, 0.0,   "current baseline"),
     ("G1", 0.5, 1.0, 0.0,   "mild guidance"),
     ("G2", 1.0, 2.0, 0.0,   "spec default α_s=2 α_g"),
     ("G3", 2.0, 4.0, 0.0,   "strong guidance"),
-    ("G4", 0.5, 1.0, 1e-3,  "mild + anti-saturation"),
-    ("G5", 1.0, 2.0, 1e-3,  "default + anti-saturation"),
-    ("G6", 2.0, 4.0, 1e-3,  "strong + anti-saturation"),
-    ("G7", 1.0, 2.0, 1e-2,  "stronger anti-saturation"),
-    ("G8", 2.0, 4.0, 1e-2,  "aggressive"),
+    ("G4", 0.5, 1.0, 0.1,   "mild + anti-saturation"),
+    ("G5", 1.0, 2.0, 0.1,   "default + anti-saturation"),
+    ("G6", 2.0, 4.0, 0.1,   "strong + anti-saturation"),
+    ("G7", 1.0, 2.0, 0.5,   "stronger anti-saturation"),
+    ("G8", 2.0, 4.0, 0.5,   "aggressive"),
 ]
 
 
@@ -144,15 +149,19 @@ def _run_config(sde, score_fn, args, a, arm, arm_a, alpha_g, alpha_s, alpha_u, z
     elif a.get("goal_h_mask") == "last_quarter": goal_h = list(range(3 * H1 // 4, H1))
     else: goal_h = [H1 - 1]
 
+    # spec §1.2 metric weights — α_p, α_R use the spec's W as base scale
+    W_p = 1.0 / (float(a["sigma_p"]) ** 2)                                      # default σ_p=0.05 → 400
+    W_R = 1.0 / (float(a["sigma_R"]) ** 2)                                      # default σ_R=0.1  → 100
+
     samples = traj_reverse_ou_chart_pose(
         sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
         n_steps=args.n_sample_steps, goal_cond=goal_cond, z_e=z_e,
         eps=a["eps"], device=device, dtype=dtype,
         T_start_Rp=T_start_Rp,
-        start_alpha_p=float(alpha_s), start_alpha_R=float(alpha_s),
+        start_alpha_p=float(alpha_s) * W_p, start_alpha_R=float(alpha_s) * W_R,
         start_h_indices=[0],
         T_target_Rp=T_target_Rp,
-        goal_alpha_p=float(alpha_g), goal_alpha_R=float(alpha_g),
+        goal_alpha_p=float(alpha_g) * W_p, goal_alpha_R=float(alpha_g) * W_R,
         goal_h_indices=goal_h,
         smoothness_alpha_vel=0.0, smoothness_alpha_acc=0.0,
         chart_norm_alpha=float(alpha_u),

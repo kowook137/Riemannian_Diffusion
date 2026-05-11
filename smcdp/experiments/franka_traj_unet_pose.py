@@ -239,6 +239,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="outputs/franka_traj_unet_pose")
     p.add_argument("--resume-from", type=str, default=None)
+    p.add_argument("--save-every", type=int, default=0,
+                   help="If > 0, save an intermediate checkpoint every N steps "
+                        "to {out_dir}/step_{step:06d}/ours_v2_pose.pt. Used for "
+                        "plateau-vs-step curves and overfitting diagnostics.")
     return p.parse_args()
 
 
@@ -443,6 +447,19 @@ def main():
         losses_log.append(loss.item())
         if step % 50 == 0:
             pbar.set_postfix(loss=f"{loss.item():.3e}")
+
+        # Plateau diagnostic: periodic checkpoint save
+        if args.save_every > 0 and (step + 1) % args.save_every == 0 and (step + 1) < args.steps:
+            sub = out_dir / f"step_{step + 1:06d}"
+            sub.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "args": vars(args),
+                "step": step + 1,
+                "net": net.state_dict(),
+                "ema_net": ema_net.state_dict(),
+                "optim": optim.state_dict(),
+                "losses_log": losses_log,
+            }, sub / "ours_v2_pose.pt")
 
     # --- save ckpt ---
     torch.save({
