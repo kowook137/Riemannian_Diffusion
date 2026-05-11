@@ -38,6 +38,8 @@ def parse_args():
     p.add_argument("--z-list", type=float, nargs="+",
                    default=[0.05, 0.10, 0.15, 0.20])
     p.add_argument("--out-name", type=str, default="eval_metrics_full.json")
+    p.add_argument("--n-sample-steps", type=int, default=None,
+                   help="Override ckpt's n_sample_steps. None → use ckpt value.")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -104,9 +106,13 @@ def main():
     # Demo + eval
     target_perturb_rad = a["target_perturb_deg"] * 3.14159265 / 180.0
     out_dir = Path(args.ckpt).parent
+    # n_sample_steps override (B: solver accuracy diagnostic)
+    n_sample_steps_eff = int(args.n_sample_steps) if args.n_sample_steps is not None else int(a["n_sample_steps"])
+    if args.n_sample_steps is not None:
+        print(f"[reeval] OVERRIDING n_sample_steps  {a['n_sample_steps']} → {n_sample_steps_eff}")
     metrics = {"per_z": [], "args": vars(args), "source_ckpt": str(args.ckpt),
                 "method_a": a.get("method_a", False),
-                "use_v51": use_v51,
+                "use_v51": use_v51, "n_sample_steps_eff": n_sample_steps_eff,
                 "config": {k: a.get(k) for k in ["sigma_p", "tikhonov_frac",
                                                    "confining_kappa", "forward_langevin_drift",
                                                    "limiting_scale", "proxy_std_mode",
