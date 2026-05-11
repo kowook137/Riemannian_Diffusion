@@ -237,6 +237,21 @@ def compute_pose_metrics(
         q_lo, q_hi = arm.joint_limits(device=device, dtype=dtype)  # (n_q,) each
         viol_per_traj = ((q_phys < q_lo) | (q_phys > q_hi)).any(-1).any(-1)  # (B,)
         joint_viol_rate = viol_per_traj.float().mean().item()
+        # Sample-wise exact effective_succ (diagnostic_plan.md §2.1):
+        # joint_safe = ~viol_per_traj, then eff_succ = (pose_ok & joint_safe).mean().
+        # The product form `succ * (1 - jvio)` is an independence-assumption
+        # approximation; pose-failure and joint-violation are typically positively
+        # correlated (a violated trajectory is also likelier to miss the target),
+        # so the product overestimates effective success.
+        joint_safe = (~viol_per_traj)
+        pose_ok_55  = ((e_p < th_5cm) & (e_R < th_5deg))
+        pose_ok_510 = ((e_p < th_5cm) & (e_R < th_10deg))
+        pose_ok_55_2cm = ((e_p < th_2cm) & (e_R < th_5deg))
+        primary["eff_pose_succ_5cm_5deg"]  = (pose_ok_55  & joint_safe).float().mean().item()
+        primary["eff_pose_succ_5cm_10deg"] = (pose_ok_510 & joint_safe).float().mean().item()
+        primary["eff_pose_succ_2cm_5deg"]  = (pose_ok_55_2cm & joint_safe).float().mean().item()
+        primary["eff_pose_succ_5cm_5deg_product"]  = primary["pose_succ_5cm_5deg"]  * (1.0 - joint_viol_rate)
+        primary["eff_pose_succ_5cm_10deg_product"] = primary["pose_succ_5cm_10deg"] * (1.0 - joint_viol_rate)
         excess_lo = (q_lo - q_phys).clamp(min=0)
         excess_hi = (q_phys - q_hi).clamp(min=0)
         e_jl = (excess_lo.pow(2) + excess_hi.pow(2)).sum(-1).mean().item()

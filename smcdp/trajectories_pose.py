@@ -33,6 +33,7 @@ from smcdp.manifolds_pose import EmbodimentPoseGraphManifold
 from smcdp.lie_se3 import (
     log_relative_Rp,
     Rp_to_pose7,
+    pose7_to_Rp,
 )
 
 
@@ -154,6 +155,7 @@ class TrajectoryScoreNetUNetPose(nn.Module):
         t_scale: float = 1000.0,
         goal_cond_dim: int = 0,
         cond_injection: str = "global",
+        endpoint_rel_cond: bool = False,
     ):
         super().__init__()
         from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
@@ -178,13 +180,34 @@ class TrajectoryScoreNetUNetPose(nn.Module):
         if cond_injection not in ("global", "channel"):
             raise ValueError(f"cond_injection must be 'global' or 'channel'")
         self.cond_injection = cond_injection
+        # diagnostic_plan §5: per-step endpoint-relative SE(3) error as extra
+        # input channels.  e_goal_h = Log_SE(3)(T_φ(ψ(u_h), z_e)^{-1} T_target)
+        # ∈ R^6, computed inside `forward` from the noisy state τ.  Only
+        # supported under cond_injection='channel' (per-h channel info needs
+        # per-h carrier).
+        self.endpoint_rel_cond = bool(endpoint_rel_cond)
+        if self.endpoint_rel_cond and self.cond_injection != "channel":
+            raise ValueError(
+                "endpoint_rel_cond=True requires cond_injection='channel' "
+                "(per-step error needs per-h channels)."
+            )
+        if self.endpoint_rel_cond and self.goal_cond_dim != 14:
+            raise ValueError(
+                "endpoint_rel_cond=True expects goal_cond_dim=14 "
+                "(T_start ⊕ T_target each in 7D pose7 storage form)."
+            )
+        self.n_endpoint_err = 6 if self.endpoint_rel_cond else 0
 
         if self.cond_injection == "global":
             global_dim = (self.n_z if self.has_embodiment else 0) + self.goal_cond_dim
             input_dim_unet = self.n_q
         else:
             global_dim = 0
-            input_dim_unet = self.n_q + self.goal_cond_dim + (self.n_z if self.has_embodiment else 0)
+            input_dim_unet = (
+                self.n_q + self.goal_cond_dim
+                + (self.n_z if self.has_embodiment else 0)
+                + self.n_endpoint_err
+            )
 
         self.unet = ConditionalUnet1D(
             input_dim=input_dim_unet,
@@ -229,6 +252,25 @@ class TrajectoryScoreNetUNetPose(nn.Module):
                 channel_inputs.append(goal_cond.unsqueeze(1).expand(-1, H1, -1))
             if self.has_embodiment:
                 channel_inputs.append(z_traj)
+            if self.endpoint_rel_cond:
+                # Per-step endpoint-relative error in body frame:
+                #   e_goal_h = Log_SE(3)( T_φ(ψ(u_h), z_h)^{-1} · T_target ) ∈ R^6
+                # `manifold.T_phi_Rp(u_h, z_h)` already routes through ψ when
+                # the manifold is bounded; for IdentityChart it is FK(q_h).
+                # `goal_cond` layout = (T_start (7), T_target (7)).
+                T_target = goal_cond[:, 7:14]                                       # (B, 7)
+                R_tgt, p_tgt = pose7_to_Rp(T_target)                                # (B, 3, 3), (B, 3)
+                u_flat = q_traj.reshape(B * H1, self.n_q)
+                if z_traj is not None:
+                    z_flat = z_traj.reshape(B * H1, self.n_z)
+                else:
+                    z_flat = torch.zeros(B * H1, 0, device=q_traj.device, dtype=q_traj.dtype)
+                R_phi_flat, p_phi_flat = self.manifold.T_phi_Rp(u_flat, z_flat)
+                R_tgt_flat = R_tgt.unsqueeze(1).expand(-1, H1, -1, -1).reshape(B * H1, 3, 3)
+                p_tgt_flat = p_tgt.unsqueeze(1).expand(-1, H1, -1).reshape(B * H1, 3)
+                e_goal_flat = log_relative_Rp(R_phi_flat, p_phi_flat, R_tgt_flat, p_tgt_flat)
+                e_goal = e_goal_flat.reshape(B, H1, 6)
+                channel_inputs.append(e_goal)
             x_input = torch.cat(channel_inputs, dim=-1)
             out_full = self.unet(x_input, t_scaled, global_cond=None)
             s_chart = out_full[..., : self.n_q]

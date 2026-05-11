@@ -50,13 +50,21 @@ class Chart(Protocol):
 class TanhBoundedChart:
     """Bounded chart via element-wise tanh diffeomorphism (v4.1 default).
 
-    ψ(u) = q_mid + (q_range / 2) tanh(u)  ∈ (q_min, q_max)
+    ψ_c(u) = q_mid + (q_range / 2) tanh(u / c)  ∈ (q_min, q_max)
+
+    The optional chart temperature `c > 0` (default 1.0) is a reparameterization
+    that stretches the chart linear region by a factor of c without changing the
+    image (q_min, q_max).  For c=2, the same physical q_clamp = q_max - δ maps to
+    u = c · atanh(1 - 2δ/q_range) instead of u = atanh(1 - 2δ/q_range), giving
+    the score net 2× the u-coordinate range at the boundary.  Mathematically
+    self-consistent as a diffeomorphism (diagnostic_plan §4); the spec requires
+    only smooth ψ : U → (q_min, q_max), and ψ_c satisfies this for any c > 0.
 
     Construct from per-joint limits (q_min, q_max). Stores tensors on CPU; lazily
     moves to the device of the input on each call.
     """
 
-    def __init__(self, q_min: Tensor, q_max: Tensor):
+    def __init__(self, q_min: Tensor, q_max: Tensor, chart_temp: float = 1.0):
         if q_min.shape != q_max.shape or q_min.dim() != 1:
             raise ValueError(
                 f"q_min, q_max must be 1-D tensors of equal shape; "
@@ -64,7 +72,10 @@ class TanhBoundedChart:
             )
         if not torch.all(q_max > q_min):
             raise ValueError("Require q_max > q_min element-wise")
+        if not (chart_temp > 0):
+            raise ValueError(f"chart_temp must be > 0, got {chart_temp}")
         self.n_q = int(q_min.shape[0])
+        self.chart_temp = float(chart_temp)
         # Store as buffers (CPU); _to dispatches on call site
         self._q_min = q_min.detach().clone()
         self._q_max = q_max.detach().clone()
@@ -81,32 +92,35 @@ class TanhBoundedChart:
         if u.shape[-1] != self.n_q:
             raise ValueError(f"Expected last-dim {self.n_q}, got {u.shape[-1]}")
         q_mid, q_range = self._broadcast(u)
-        return q_mid + 0.5 * q_range * torch.tanh(u)
+        return q_mid + 0.5 * q_range * torch.tanh(u / self.chart_temp)
 
     def psi_inv(self, q: Tensor, *, eps: float = 1e-3) -> Tensor:
         """Inverse map with η-clipping. Init-only safety per v4.1 §10.3.
 
-        Computes η = 2(q - q_mid)/q_range, clips to [-1+eps, 1-eps], then atanh.
-        Out-of-range q values silently get clipped (warning emitted in debug
-        builds via assertion). For typical usage `q` should already be inside
-        (q_min, q_max).
+        Computes η = 2(q - q_mid)/q_range, clips to [-1+eps, 1-eps], then
+        c · atanh(η).  Out-of-range q values silently get clipped (warning
+        emitted in debug builds via assertion). For typical usage `q` should
+        already be inside (q_min, q_max).
         """
         if q.shape[-1] != self.n_q:
             raise ValueError(f"Expected last-dim {self.n_q}, got {q.shape[-1]}")
         q_mid, q_range = self._broadcast(q)
         eta = 2.0 * (q - q_mid) / q_range
         eta = eta.clamp(min=-1.0 + eps, max=1.0 - eps)
-        return torch.atanh(eta)
+        return self.chart_temp * torch.atanh(eta)
 
     def D_psi_diag(self, u: Tensor) -> Tensor:
-        """Diagonal of ∂ψ/∂u: (q_range/2) sech²(u). Always > 0."""
+        """Diagonal of ∂ψ/∂u: (q_range/(2c)) sech²(u/c). Always > 0.
+
+        Chain rule for ψ_c(u) = q_mid + (q_range/2) tanh(u/c):
+            ∂ψ_c/∂u = (q_range/2) · sech²(u/c) · (1/c) = (q_range/(2c)) sech²(u/c)
+        """
         if u.shape[-1] != self.n_q:
             raise ValueError(f"Expected last-dim {self.n_q}, got {u.shape[-1]}")
         _, q_range = self._broadcast(u)
-        # sech²(u) = 1 - tanh²(u) = 1 / cosh²(u). Use 1 - tanh² for numerical
-        # stability across the range (tanh² ∈ [0, 1)).
-        sech_sq = 1.0 - torch.tanh(u).pow(2)
-        return 0.5 * q_range * sech_sq
+        # sech²(u/c) = 1 - tanh²(u/c). Use 1 - tanh² for numerical stability.
+        sech_sq = 1.0 - torch.tanh(u / self.chart_temp).pow(2)
+        return (0.5 * q_range / self.chart_temp) * sech_sq
 
     def joint_limits(self, *, device=None, dtype=None) -> tuple[Tensor, Tensor]:
         return (self._q_min.to(device=device, dtype=dtype),
@@ -146,6 +160,7 @@ def make_chart_from_manifold(
     manifold,
     *,
     bounded: bool,
+    chart_temp: float = 1.0,
     device=None,
     dtype=None,
 ) -> Chart:
@@ -153,6 +168,7 @@ def make_chart_from_manifold(
 
     bounded=False  →  IdentityChart (v4)
     bounded=True   →  TanhBoundedChart with limits from `manifold.joint_limits()`
+                       and the requested `chart_temp` (default 1.0).
     """
     n_q = int(manifold.n_q)
     if not bounded:
@@ -166,4 +182,4 @@ def make_chart_from_manifold(
     if q_min.shape[0] != n_q:
         raise ValueError(f"manifold.joint_limits returned shape {q_min.shape}, "
                           f"expected ({n_q},)")
-    return TanhBoundedChart(q_min, q_max)
+    return TanhBoundedChart(q_min, q_max, chart_temp=chart_temp)

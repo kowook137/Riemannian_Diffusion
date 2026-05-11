@@ -78,7 +78,11 @@ def main():
     # Args saved via vars(args), so flags propagate transparently.
     if a.get("bounded_chart", False):
         arm = BoundedChartPoseManifold(
-            arm, make_chart_from_manifold(arm, bounded=True),
+            arm,
+            make_chart_from_manifold(
+                arm, bounded=True,
+                chart_temp=float(a.get("chart_temp", 1.0)),
+            ),
             lambda_floor=float(a.get("lambda_floor", 1e-4)),
         )
         print(f"[v4.1] bounded chart wrapper reconstructed "
@@ -104,7 +108,9 @@ def main():
         diffusion_step_embed_dim=a["diff_step_embed"],
         n_groups=a["unet_groups"], kernel_size=a["unet_kernel"],
         cond_predict_scale=False, t_scale=a["t_scale"],
-        goal_cond_dim=14, cond_injection=a["cond_injection"]).to(device=device, dtype=dtype)
+        goal_cond_dim=14, cond_injection=a["cond_injection"],
+        endpoint_rel_cond=bool(a.get("endpoint_rel_cond", False)),
+    ).to(device=device, dtype=dtype)
     net.load_state_dict(ckpt["ema_net"]); net.eval()
     score_fn = TrajectoryScaledScoreFnPose(net, sde, std_trick=True,
                                              proxy_std_mode=proxy_std_mode)

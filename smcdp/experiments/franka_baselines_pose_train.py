@@ -79,6 +79,13 @@ def parse_args():
                         "joint_limit_extension.tex Sec 3-5.")
     p.add_argument("--lambda-floor", type=float, default=1e-4,
                    help="Tikhonov floor on G_Q^A; only active when --bounded-chart.")
+    p.add_argument("--chart-temp", type=float, default=1.0,
+                   help="diagnostic_plan §4: TanhBoundedChart temperature c "
+                        "(only active when --bounded-chart). c>1 stretches the "
+                        "chart linear region — same q_clamp maps to u=c·atanh(...) "
+                        "giving the score net more u-coordinate range at the "
+                        "boundary. Reparameterization is mathematically "
+                        "spec-consistent for any c > 0.")
     p.add_argument("--demo-pool-size", type=int, default=0,
                    help="If > 0, pre-generate this many demos once at startup and "
                         "sample minibatches from the cached pool during training. "
@@ -156,10 +163,12 @@ def main():
 
     if args.bounded_chart:
         arm = BoundedChartPoseManifold(
-            arm, make_chart_from_manifold(arm, bounded=True),
+            arm,
+            make_chart_from_manifold(arm, bounded=True, chart_temp=float(args.chart_temp)),
             lambda_floor=float(args.lambda_floor),
         )
-        print(f"[bounded-chart] enabled (TanhBoundedChart, λ_floor={args.lambda_floor:.1e}) "
+        print(f"[bounded-chart] enabled (TanhBoundedChart, "
+              f"chart_temp={args.chart_temp:.2f}, λ_floor={args.lambda_floor:.1e}) "
               f"— DP-bounded mode; chart slot = u, psi(u) auto-feasible.")
     else:
         print(f"[bounded-chart] disabled — DP-raw mode (chart slot = q in R^7).")

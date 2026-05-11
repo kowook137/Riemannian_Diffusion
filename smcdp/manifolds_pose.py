@@ -610,12 +610,27 @@ class BoundedChartPoseManifold(EmbodimentPoseGraphManifold):
             lam = (tikhonov_frac * tr_G / self.n_q + lambda_floor)
             lam = lam.unsqueeze(-1).unsqueeze(-1)
             G = G + lam * eye
-        for j in (jitter, jitter * 10.0, jitter * 100.0):
+        for j in (jitter, jitter * 10.0, jitter * 100.0, jitter * 1000.0):
             try:
                 return torch.linalg.cholesky(G + j * eye)
             except torch._C._LinAlgError:
                 continue
-        return torch.linalg.cholesky(G + (jitter * 1000.0) * eye)
+        # Per-element fallback for pathological batch entries (NaN/Inf in G,
+        # or numerical degeneration past additive ridge tolerance — happens at
+        # chart saturation |u|>>3 where D_psi→0).  Replace the bad slice with
+        # ridge·I so cholesky_solve returns a well-defined (1/ridge)·∂R
+        # direction.  Required for v5.1 anti-saturation R_u path (G4-G8).
+        G_test = G + (jitter * 1000.0) * eye
+        info = torch.linalg.cholesky_ex(G_test).info                  # (...,)
+        bad = info.ne(0)
+        if bad.any():
+            ridge = max(float(lambda_floor), 1.0)
+            G_safe = torch.where(
+                bad.view(*bad.shape, 1, 1), ridge * eye, G_test,
+            )
+        else:
+            G_safe = G_test
+        return torch.linalg.cholesky(G_safe)
 
     # ---------------- limits / sanity (v4.1 §13) ----------------
 

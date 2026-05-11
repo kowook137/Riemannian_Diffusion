@@ -926,6 +926,133 @@ v5.1 (chart-OU SDE, IK-free reference distribution, exact Euclidean score, bound
 
 ---
 
+## 13. Plateau-vs-plateau 비교 (200k 학습, 2026-05-12)
+
+### 13.0 동기 — §12 비교의 불공정성 정정
+
+§12.2 / §12.3 의 "DP family 능가" 결론은 **v5.1 100k vs DP 15k** 의 비대칭 비교였다. DP-raw, DP-bounded 의 default `--steps 15000` 만 학습된 ckpt 와 v5.1 100k 를 비교한 결과 — DP 의 plateau 가 어디인지 측정하지 않은 채 v5.1 의 100k 성능이 우위라고 보고. Plateau 측정 없이는 "더 학습하면 closer 또는 reverse 될 수 있는가" 를 답할 수 없다.
+
+본 절은 세 method 모두 **동일 학습량 (200k step)** 으로 학습하고 25k step 마다 intermediate ckpt 를 저장해 succ-vs-step 곡선을 측정, 각 method 의 plateau / overfit 양상을 확인한 결과를 정리한다.
+
+### 13.1 Setup
+
+- **Trainer 양쪽에 `--save-every 25000`** 옵션 추가 (`smcdp/experiments/franka_traj_unet_pose.py`, `smcdp/experiments/franka_baselines_pose_train.py`).  25k, 50k, 75k, 100k, 125k, 150k, 175k 7개 + final 200k = 8 ckpt × 3 method = 24 ckpt.
+- **Eval driver**: `smcdp/experiments/plateau_eval_and_plot.py` — 각 method 의 step_NNNNNN/ ckpt 를 모두 발견, 적절한 eval driver (v5.1 → `franka_pose_reeval`, DP → `franka_baselines_pose_eval`) 자동 dispatch, per-z 평균 metric 집계, succ-vs-step 4-panel plot, plateau step + overfit verdict (best > final by >2 pp) 산출.
+- **Eval config**: n_sample_steps=1000, n_eval_per_z=64, z_e ∈ {0.05, 0.10, 0.15, 0.20}, success threshold (5 cm, 10°) primary.
+
+### 13.2 학습 곡선 — succ@(5cm, 10°), per step
+
+| step | v5.1 | DP-raw | DP-bounded |
+|------|----:|------:|----------:|
+|  25k | 43.4% | 89.8% | 81.6% |
+|  50k | 64.1% | 92.6% | 90.2% |
+|  75k | 75.4% | 94.5% | 93.0% |
+| 100k | 76.2% | 94.1% | 92.6% |
+| 125k | 80.9% | 95.7% | 92.6% |
+| 150k | 83.6% | 95.3% | 93.4% |
+| **175k** | **86.7%** ← peak | **96.5%** | 93.0% |
+| 200k | 84.8% | 96.5% | **94.5%** ← peak |
+
+Pos error (cm) — v5.1 만 monotonic 감소 지속 (3.30 @200k), succ saturate 후에도 mean precision 개선됨을 시사.
+
+### 13.3 Plateau / overfit 진단
+
+| 방법 | plateau step | best succ510 | final (200k) | Δ(best−final) | verdict |
+|------|------------:|-----:|-----:|----:|-----|
+| v5.1 (Ours) | 175k | 86.7% | 84.8% | **−1.9 pp** | borderline mild regression (2 pp 임계 직전) |
+| DP-raw | 175k = 200k | 96.5% | 96.5% | 0 | 완전 plateau |
+| DP-bounded | 200k | 94.5% | 94.5% | 0 | **아직 monotonic 증가 중**, 200k+ 추가 학습으로 추가 향상 가능 |
+
+### 13.4 200k 최종 비교 (raw)
+
+| 방법 | step | pos cm | rot° | succ@(5,5°) | succ@(5,10°) | mfe | **joint viol** |
+|------|----:|----:|----:|----:|----:|----:|----:|
+| v5.1 (G0 sampler) | 175k | 3.44 | 5.10 | 71.5% | **86.7%** | 0.00 | **0.0%** |
+| DP-raw | 175k | 1.38 | 1.78 | 94.5% | **96.5%** | 0.00 | ⚠ **18.4%** |
+| DP-bounded | 200k | 1.78 | 2.00 | 92.2% | **94.5%** | 0.00 | 0.4% |
+
+**DP-raw 의 96.5% succ 는 측정 인공물**.  Joint violation rate 18.4% — 즉 "성공" trajectory 의 1/5 이 q 한계를 위반하여 실제 robot 배포 불가.  `effective_succ = succ × (1 − jvio)` 으로 보정 시:
+
+| 방법 | step | succ@(5,10°) | jvio | **effective succ** |
+|------|----:|----:|----:|----:|
+| DP-raw | 175k | 96.5% | 18.4% | **78.7%** |
+| DP-bounded | 200k | 94.5% | 0.4% | **94.1%** ★ |
+| v5.1 (G0 sampler) | 175k | 86.7% | 0.0% | **86.7%** |
+
+**Plateau-vs-plateau 기준 best feasibility-respecting method = DP-bounded (94.1%)**.  §12.3 의 "v5.1 100k 가 DP family 능가" claim 은 학습 단계 비대칭에 기인한 결과로, 동일 200k 비교에서는 **반대로 DP-bounded 가 +7.4 pp 우위**.
+
+### 13.5 v5.1 sampling-time recipe sweep — spec §7 guidance + §10 R_u 모두 켜기
+
+§12.5 의 guidance sweep 은 v5.1 100k ckpt 에서 측정. 200k ckpt 에서 spec 의 sampling-time 메커니즘 **전체** (guidance term 의 `start_alpha_p/R`, `goal_alpha_p/R`, chart-norm penalty `R_u`) 를 9 config 로 재측정:
+
+**Config grid** (`smcdp/experiments/franka_pose_v51_guidance_sweep.py`):  α_p/α_R = α_s · W_p / α_s · W_R (W_p = 1/σ_p² = 400, W_R = 1/σ_R² = 100), α_g 는 goal 측 동일 scale.
+
+| config | α_g | α_s | α_u | pos cm | rot° | succ@(5,5°) | **succ@(5,10°)** | ‖u‖∞ p99 | sat>3 | jvio |
+|--------|---:|---:|---:|----:|---:|----:|------:|---:|----:|----:|
+| **G0** baseline (guidance OFF) | 0 | 0 | 0 | 3.30 | 5.07 | 68.4% | **84.8%** | 3.52 | 37.5% | 0.0% |
+| G1 mild | 0.5 | 1 | 0 | 3.37 | 5.04 | 68.8% | 85.2% | 3.53 | 37.5% | 0.0% |
+| G2 spec default | 1 | 2 | 0 | 3.68 | 5.23 | 68.0% | 84.4% | 3.52 | 37.5% | 0.0% |
+| G3 strong | 2 | 4 | 0 | 3.56 | 5.39 | 69.1% | 84.4% | 3.52 | 37.5% | 0.0% |
+| G4 mild + R_u | 0.5 | 1 | 0.1 | 3.40 | 5.00 | 67.2% | 85.2% | 3.52 | 37.5% | 0.0% |
+| G5 default + R_u | 1 | 2 | 0.1 | 3.62 | 5.09 | 67.6% | 85.2% | 3.51 | 37.5% | 0.0% |
+| G6 strong + R_u | 2 | 4 | 0.1 | 3.63 | 5.38 | 68.0% | 84.0% | 3.51 | 37.5% | 0.0% |
+| G7 R_u=0.5 | 1 | 2 | 0.5 | 4.24 | 5.69 | 65.6% | 82.0% | 3.49 | 37.1% | 0.0% |
+| G8 aggressive | 2 | 4 | 0.5 | 4.03 | 5.79 | 66.8% | 80.1% | 3.49 | 37.1% | 0.0% |
+
+**핵심 관찰**:
+
+1. **모든 sampling-time 메커니즘이 ceiling 못 깸**.  최선 (G1/G4/G5) = **85.2%**, baseline 대비 +0.4 pp (통계적 변동 수준).
+2. **‖u‖∞ p99 가 α_u 변화에 거의 무반응** (0 → 0.5 의 5× 증가에도 3.52 → 3.49).  Sampling-time soft penalty 로 chart 분포 mass 를 못 옮김.  sat>3 rate 37% 가 변하지 않음.
+3. **강한 R_u (G7, G8) 는 오히려 악화**.  pos err 3.30 → 4.0+ cm, succ 84.8% → 80%.  Score field 와 충돌.
+4. **DP-bounded 94.1% effective 와의 −9 pp gap 은 sampling-time 메커니즘 (guidance + R_u) 으로 닫히지 않음**.
+
+### 13.6 진단 — sampling-time ceiling 의 근원
+
+#### Chart saturation 은 training-time 현상
+
+학습된 score net 의 분포 mass 가 이미 ‖u‖∞ ≈ 3.5 saturation 영역에 위치 (sat>3 = 37%).  Sampling 단계에서 soft penalty (chart-form natural gradient $-\alpha_u G^{-1} \cdot 2u$) 로는 이 학습된 분포 자체를 옮길 수 없다.
+
+#### Endpoint precision gap 의 구조적 원인
+
+| metric | v5.1 (200k) | DP-bounded (200k) | gap |
+|--------|----:|----:|----:|
+| pos err mean | 3.30 cm | 1.78 cm | **1.85×** |
+| rot err mean | 5.07° | 2.00° | **2.5×** |
+| succ@(5,10°) | 84.8% | 94.5% | −9.7 pp |
+| sat>3 rate | 37% | — (no chart) | — |
+
+DP-bounded 는 trajectory ambient $q \in \mathbb R^7$ 에 직접 diffuse 하고 chart wrap 은 sampling 시 한 번만 적용 (`q = \psi(u)`).  v5.1 은 학습 내내 chart 좌표 $u$ 에 diffuse — saturation 영역에서 학습 신호가 약해지는 구조적 단점.
+
+#### Sampling 시 noise vs. drift balance
+
+v5.1 175k → 200k 의 succ510 1.9 pp 하락은 **training loss 는 계속 감소 (score net 정밀도 개선) 인데 succ 가 약간 흔들리는 양상** — sampling-time variance 가 train-time 정밀도 개선보다 큰 영역에 진입.  Drift coefficient $\beta_f = 20$ 의 reverse step 1000 까지 떨어뜨려도 chart-boundary 근처 sample 의 stochastic kick 이 endpoint precision 을 자체 한계로 묶음.
+
+### 13.7 결론 — 200k plateau 시점의 honest verdict
+
+**Plateau-vs-plateau (200k) 정합 비교 결과**:
+
+1. **DP-bounded 가 feasibility-respecting 영역의 최강** (effective 94.1%, 200k 에서도 monotonic 증가 중).
+2. **v5.1 (Ours-v5.1) 은 본 ckpt 에서 sampling-time recipe 모두 동원해도 ceiling = 85.2%** — DP-bounded 대비 −9 pp.
+3. **DP-raw 96.5% 는 비교 대상 부적격** (jvio 18% → effective 78.7%).
+4. **§12 의 "v5.1 100k 가 DP family 능가" 평가는 학습 단계 비대칭 (v5.1 100k vs DP 15k) 에 기인한 결과**.  Plateau-vs-plateau 에서 부분 반전.
+5. **v5.1 가 우위인 영역은 여전히 있음**: $z_e$ generalization (OOD $z_e=0.20$), $q_\phi$ feasibility 의 0% (DP-bounded 0.4%), manifold gap = 0 (DP-bounded 의 $T \ne T_\phi$ 와 대조), mode capture mfe=0.  본 framework 의 "구조 보존 + IK-free + multimodal" 가치는 §12.7 그대로 유효.
+6. **endpoint precision gap 을 좁히려면 sampling-time 으로는 불가능**.  필요한 변경은:
+   - **Training-time R_u**: $\mu_u \sum_h \|u_h\|^2$ 를 score loss 와 동시 최소화 (μ_pose-style 이지만 minimizer 가 score 와 호환 — Varadhan 발산 문제 없음).
+   - **Chart 범위 확대**: TanhBoundedChart 의 `q_range` factor 를 ×1.5~2 로 늘려 saturation 영역을 physical 한계 밖으로 밀어냄.
+   - **Endpoint conditioning 강화**: T_target 의 score-net injection 을 단순 concat 이 아닌 chart-aware FiLM 등으로 강화 → endpoint refinement 자체를 score 가 학습.
+
+### 13.8 산출물
+
+| 항목 | 경로 |
+|---|---|
+| Training ckpts | `outputs/v51_tier2_200k_plateau/`, `outputs/tier2_dp_raw_200k_plateau/`, `outputs/tier2_dp_bounded_200k_plateau/` (각 8 ckpt) |
+| Plateau eval JSON | `outputs/plateau_200k_comparison/plateau_curves.json` (24 ckpt × per-z metric), `plateau_summary.json` |
+| Plateau plot | `outputs/plateau_200k_comparison/plateau_curves.png` (4-panel: succ55, succ510, pos, rot vs step) |
+| 200k guidance sweep | `outputs/v51_tier2_200k_plateau/guidance_sweep_v51_200k.{json,md}` (G0–G8) |
+| Cholesky fix | `smcdp/manifolds_pose.py:613` — `BoundedChartPoseManifold.G_pose_chol` 의 jitter chain 끝에 per-element NaN/non-PSD fallback 추가 (`ridge·I` 로 batch 의 bad slice 만 교체).  Chart saturation 시 R_u sweep G4–G8 가 crash 안 나도록. |
+
+---
+
 ## 부록 B: 진단 보고서 5가지 의심의 검증 상태
 
 | # | 의심 | 상태 |

@@ -166,6 +166,23 @@ def parse_args():
                         "under Choice A (G_Q^A >= I globally) but retained for "
                         "arithmetic underflow safety.  Active only when "
                         "--bounded-chart is set.")
+    p.add_argument("--endpoint-rel-cond", action="store_true",
+                   help="diagnostic_plan §5: add per-step endpoint-relative "
+                        "SE(3) error e_goal_h = Log_SE3(T_φ(ψ(u_h),z_e)^{-1} "
+                        "T_target) ∈ R^6 as 6 extra input channels to the score "
+                        "net.  Computed inside forward() from the noisy state "
+                        "τ, fully differentiable.  Requires cond_injection="
+                        "'channel' and goal_cond_dim=14.")
+    p.add_argument("--chart-temp", type=float, default=1.0,
+                   help="diagnostic_plan §4: TanhBoundedChart temperature c. "
+                        "psi(u) = q_mid + (q_range/2) tanh(u/c); c=1 = legacy "
+                        "(spec v4.1/v5.1 default).  c>1 stretches the chart "
+                        "linear region by factor c so the same q_clamp maps to "
+                        "u = c·atanh(...) instead of atanh(...).  All of psi, "
+                        "psi_inv, D_psi are scaled consistently; G_Q^A, J^Q, "
+                        "score loss, and reference distribution remain "
+                        "spec-consistent under any c > 0.  Active only when "
+                        "--bounded-chart is set.")
     # joint_limit_extension v5.1 — chart-space OU (replaces v4.1 Brownian + IK seed)
     p.add_argument("--use-v51", action="store_true",
                    help="v5.1: enable chart-space OU SDE pipeline "
@@ -303,10 +320,12 @@ def main():
     # `arm.physical_q(x)` recovers q = ψ(u) when needed.
     if args.bounded_chart:
         arm = BoundedChartPoseManifold(
-            arm, make_chart_from_manifold(arm, bounded=True),
+            arm,
+            make_chart_from_manifold(arm, bounded=True, chart_temp=float(args.chart_temp)),
             lambda_floor=float(args.lambda_floor),
         )
-        print(f"[v4.1] bounded chart enabled (TanhBoundedChart, λ_floor={args.lambda_floor:.1e})")
+        print(f"[v4.1] bounded chart enabled (TanhBoundedChart, "
+              f"chart_temp={args.chart_temp:.2f}, λ_floor={args.lambda_floor:.1e})")
     else:
         print(f"[v4.1] bounded chart disabled (v4 unbounded chart, q ∈ R^n_q)")
 
@@ -354,6 +373,7 @@ def main():
         n_groups=args.unet_groups, kernel_size=args.unet_kernel,
         cond_predict_scale=False, t_scale=args.t_scale,
         goal_cond_dim=14, cond_injection=args.cond_injection,
+        endpoint_rel_cond=bool(args.endpoint_rel_cond),
     ).to(device=device, dtype=dtype)
     ema_net = copy.deepcopy(net).to(device=device, dtype=dtype)
     for p in ema_net.parameters():

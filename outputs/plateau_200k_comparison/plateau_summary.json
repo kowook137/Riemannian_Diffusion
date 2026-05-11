@@ -1,0 +1,23 @@
+{
+  "v5.1": {
+    "plateau_step": 175000,
+    "best_succ510": 0.8671875,
+    "final_step": 200000,
+    "final_succ510": 0.84765625,
+    "overfit": false
+  },
+  "DP-raw": {
+    "plateau_step": 175000,
+    "best_succ510": 0.96484375,
+    "final_step": 200000,
+    "final_succ510": 0.96484375,
+    "overfit": false
+  },
+  "DP-bounded": {
+    "plateau_step": 200000,
+    "best_succ510": 0.9453125,
+    "final_step": 200000,
+    "final_succ510": 0.9453125,
+    "overfit": false
+  }
+}

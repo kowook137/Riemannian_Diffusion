@@ -1,0 +1,248 @@
+{
+  "v5.1": [
+    {
+      "step": 25000,
+      "pos_err_mean_cm": 7.1136342361569405,
+      "rot_err_mean_deg": 9.436915285379072,
+      "pose_succ_5cm_5deg": 0.14453125,
+      "pose_succ_5cm_10deg": 0.43359375,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_025000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 50000,
+      "pos_err_mean_cm": 4.948608484119177,
+      "rot_err_mean_deg": 7.087489119514595,
+      "pose_succ_5cm_5deg": 0.390625,
+      "pose_succ_5cm_10deg": 0.640625,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_050000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 75000,
+      "pos_err_mean_cm": 3.9847932755947113,
+      "rot_err_mean_deg": 6.030724278842633,
+      "pose_succ_5cm_5deg": 0.53125,
+      "pose_succ_5cm_10deg": 0.75390625,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_075000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 100000,
+      "pos_err_mean_cm": 4.075726820155978,
+      "rot_err_mean_deg": 5.991746737126897,
+      "pose_succ_5cm_5deg": 0.52734375,
+      "pose_succ_5cm_10deg": 0.76171875,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_100000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 125000,
+      "pos_err_mean_cm": 3.8443836849182844,
+      "rot_err_mean_deg": 5.68068540817253,
+      "pose_succ_5cm_5deg": 0.6015625,
+      "pose_succ_5cm_10deg": 0.80859375,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_125000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 150000,
+      "pos_err_mean_cm": 3.5205423831939697,
+      "rot_err_mean_deg": 5.018495900097149,
+      "pose_succ_5cm_5deg": 0.6328125,
+      "pose_succ_5cm_10deg": 0.8359375,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_150000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 175000,
+      "pos_err_mean_cm": 3.441405016928911,
+      "rot_err_mean_deg": 5.098597797362119,
+      "pose_succ_5cm_5deg": 0.71484375,
+      "pose_succ_5cm_10deg": 0.8671875,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/step_175000/eval_metrics_nsteps_1000.json"
+    },
+    {
+      "step": 200000,
+      "pos_err_mean_cm": 3.301567630842328,
+      "rot_err_mean_deg": 5.0708553832225265,
+      "pose_succ_5cm_5deg": 0.68359375,
+      "pose_succ_5cm_10deg": 0.84765625,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.0,
+      "_json": "outputs/v51_tier2_200k_plateau/eval_metrics_nsteps_1000.json"
+    }
+  ],
+  "DP-raw": [
+    {
+      "step": 25000,
+      "pos_err_mean_cm": 3.8486179895699024,
+      "rot_err_mean_deg": 3.9930582556619783,
+      "pose_succ_5cm_5deg": 0.85546875,
+      "pose_succ_5cm_10deg": 0.8984375,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.203125,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_025000/eval_metrics.json"
+    },
+    {
+      "step": 50000,
+      "pos_err_mean_cm": 2.4996083229780197,
+      "rot_err_mean_deg": 2.6773511251579007,
+      "pose_succ_5cm_5deg": 0.91015625,
+      "pose_succ_5cm_10deg": 0.92578125,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.21484375,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_050000/eval_metrics.json"
+    },
+    {
+      "step": 75000,
+      "pos_err_mean_cm": 1.6250337474048138,
+      "rot_err_mean_deg": 2.199738301335417,
+      "pose_succ_5cm_5deg": 0.921875,
+      "pose_succ_5cm_10deg": 0.9453125,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.1875,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_075000/eval_metrics.json"
+    },
+    {
+      "step": 100000,
+      "pos_err_mean_cm": 1.5063218073919415,
+      "rot_err_mean_deg": 1.7480536493346692,
+      "pose_succ_5cm_5deg": 0.92578125,
+      "pose_succ_5cm_10deg": 0.94140625,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.19921875,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_100000/eval_metrics.json"
+    },
+    {
+      "step": 125000,
+      "pos_err_mean_cm": 1.7881929175928235,
+      "rot_err_mean_deg": 2.0860107424562386,
+      "pose_succ_5cm_5deg": 0.92578125,
+      "pose_succ_5cm_10deg": 0.95703125,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.1875,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_125000/eval_metrics.json"
+    },
+    {
+      "step": 150000,
+      "pos_err_mean_cm": 1.8269069259986281,
+      "rot_err_mean_deg": 1.9586935884083945,
+      "pose_succ_5cm_5deg": 0.93359375,
+      "pose_succ_5cm_10deg": 0.953125,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.19140625,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_150000/eval_metrics.json"
+    },
+    {
+      "step": 175000,
+      "pos_err_mean_cm": 1.3752376660704613,
+      "rot_err_mean_deg": 1.7763169988006082,
+      "pose_succ_5cm_5deg": 0.9453125,
+      "pose_succ_5cm_10deg": 0.96484375,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.18359375,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/step_175000/eval_metrics.json"
+    },
+    {
+      "step": 200000,
+      "pos_err_mean_cm": 1.2663474073633552,
+      "rot_err_mean_deg": 1.5518479810504433,
+      "pose_succ_5cm_5deg": 0.93359375,
+      "pose_succ_5cm_10deg": 0.96484375,
+      "mode_frac_err": 0.0,
+      "joint_viol_rate": 0.1875,
+      "_json": "outputs/tier2_dp_raw_200k_plateau/eval_metrics.json"
+    }
+  ],
+  "DP-bounded": [
+    {
+      "step": 25000,
+      "pos_err_mean_cm": 5.427040066570044,
+      "rot_err_mean_deg": 5.901430025153908,
+      "pose_succ_5cm_5deg": 0.765625,
+      "pose_succ_5cm_10deg": 0.81640625,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_025000/eval_metrics.json"
+    },
+    {
+      "step": 50000,
+      "pos_err_mean_cm": 3.096675453707576,
+      "rot_err_mean_deg": 3.24707134445468,
+      "pose_succ_5cm_5deg": 0.87890625,
+      "pose_succ_5cm_10deg": 0.90234375,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_050000/eval_metrics.json"
+    },
+    {
+      "step": 75000,
+      "pos_err_mean_cm": 2.541211061179638,
+      "rot_err_mean_deg": 2.9393841289502993,
+      "pose_succ_5cm_5deg": 0.91015625,
+      "pose_succ_5cm_10deg": 0.9296875,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_075000/eval_metrics.json"
+    },
+    {
+      "step": 100000,
+      "pos_err_mean_cm": 2.2242457838729024,
+      "rot_err_mean_deg": 2.542448485747802,
+      "pose_succ_5cm_5deg": 0.91015625,
+      "pose_succ_5cm_10deg": 0.92578125,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_100000/eval_metrics.json"
+    },
+    {
+      "step": 125000,
+      "pos_err_mean_cm": 2.017504535615444,
+      "rot_err_mean_deg": 2.7574541696812083,
+      "pose_succ_5cm_5deg": 0.90625,
+      "pose_succ_5cm_10deg": 0.92578125,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_125000/eval_metrics.json"
+    },
+    {
+      "step": 150000,
+      "pos_err_mean_cm": 1.9112224224954844,
+      "rot_err_mean_deg": 2.548383386528014,
+      "pose_succ_5cm_5deg": 0.9140625,
+      "pose_succ_5cm_10deg": 0.93359375,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_150000/eval_metrics.json"
+    },
+    {
+      "step": 175000,
+      "pos_err_mean_cm": 1.732532144524157,
+      "rot_err_mean_deg": 2.423568162789657,
+      "pose_succ_5cm_5deg": 0.90625,
+      "pose_succ_5cm_10deg": 0.9296875,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/step_175000/eval_metrics.json"
+    },
+    {
+      "step": 200000,
+      "pos_err_mean_cm": 1.7820944776758552,
+      "rot_err_mean_deg": 2.0027652506257696,
+      "pose_succ_5cm_5deg": 0.921875,
+      "pose_succ_5cm_10deg": 0.9453125,
+      "mode_frac_err": 0.00390625,
+      "joint_viol_rate": 0.00390625,
+      "_json": "outputs/tier2_dp_bounded_200k_plateau/eval_metrics.json"
+    }
+  ]
+}

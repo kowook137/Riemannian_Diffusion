@@ -1,610 +1,595 @@
-````markdown
-# SMCDP v5.1 Ours Recipe Search Plan
-
-## 0. 현재 상황 요약
-
-현재 v5.1 baseline은 다음 조건에서 평가되었다.
-
-```text
-v5.1 50k baseline
-- chart-OU
-- IK-free
-- guidance off
-- μ_pose = 0
-- β_f = 20
-- Ḡ_Q = I
-````
-
-주요 결과:
-
-| Metric             | v4.1 50k + IK seed | v5.1 50k IK-free | 해석                           |
-| ------------------ | -----------------: | ---------------: | ---------------------------- |
-| pos err 평균         |            4.77 cm |          5.73 cm | +0.96 cm worse               |
-| rot err 평균         |              6.46° |            8.15° | +1.69° worse                 |
-| succ@(5cm,5°)      |             64.84% |            17.6% | −47.3 pp                     |
-| succ@(5cm,10°)     |             71.88% |            47.3% | −24.6 pp                     |
-| joint violation    |                 0% |               0% | bounded chart 성공             |
-| mode capture error |               0.00 |             0.00 | score net 단독으로 bimodality 보존 |
-| manifold gap       |                  0 |                0 | graph retraction 정상          |
-| ‖u‖∞ p99           |                n/a |             3.57 | saturation regime, concern   |
-
-핵심 해석:
-
-> v5.1은 IK-free 구조, joint feasibility, learned-manifold adherence, bimodality 보존에는 성공했다.
-> 그러나 endpoint pose refinement가 부족하고, chart saturation이 발생한다.
-
-즉, 지금 목적은 baseline 비교가 아니라 **ours recipe 탐색**이다.
+맞다. 지금 필요한 것은 **claim 정리가 아니라 코드/실험 수정 리스트**다.
+아래는 **gap을 줄이기 위해 실제 코드에서 손봐야 할 가능성이 높은 부분**만 정리한 것이다.
 
 ---
 
-## 1. 현재 문제 정의
+# 1. DP-bounded는 정확히 무엇인가?
 
-v5.1 baseline의 주요 문제는 두 가지다.
+현재 네 코드의 **DP-bounded**는 특정 논문에 원래 존재하는 baseline이라기보다, 네가 만든 **Diffusion Policy + bounded chart wrapper baseline**으로 보는 게 정확하다.
 
-### Problem 1 — Endpoint refinement 부족
+기본 골격은 **Diffusion Policy: Visuomotor Policy Learning via Action Diffusion**의 action-trajectory diffusion baseline이다. 이 논문은 robot policy를 conditional denoising diffusion process로 보고, action trajectory distribution의 score를 학습해 multimodal action을 생성하는 방법을 제안한다. ([arXiv][1])
 
-strict success가 크게 낮다.
-
-```text
-succ@(5cm,5°): 17.6%
-succ@(5cm,10°): 47.3%
-```
-
-mode capture는 유지되므로, 문제는 branch selection 실패라기보다 다음에 가깝다.
-
-> mode는 맞게 선택하지만, mode 내부에서 endpoint pose precision이 부족하다.
-
----
-
-### Problem 2 — Chart saturation
-
-현재
+그 위에 네 코드에서는 action을 직접 (q)로 두는 대신 bounded chart를 씌운 것이다.
 
 [
-|u|_\infty^{p99}=3.57
+u \sim \text{DP},\qquad q=\psi(u)
+]
+
+즉:
+
+```text
+DP-bounded = Diffusion Policy-style trajectory diffusion
+             + bounded chart readout q = ψ(u)
+             + optional execution through Tφ(q, ze) during eval
+```
+
+따라서 논문명으로 쓰면:
+
+```text
+Bounded Diffusion Policy baseline
+```
+
+또는:
+
+```text
+Diffusion Policy with bounded joint-chart parameterization
+```
+
+이 맞다.
+
+**주의:** DP-bounded는 원 Diffusion Policy 논문의 공식 variant는 아니다. 네 연구에서 joint-limit fairness를 위해 만든 **strong adapted baseline**이다.
+
+---
+
+# 2. 지금 가장 먼저 수정해야 할 코드: 평가 metric audit
+
+## 2.1 `effective_succ`를 곱으로 계산하지 말 것
+
+현재 보고서에는 일부에서:
+
+[
+\text{effective_succ}
+=====================
+
+\text{succ}\times(1-\text{jvio})
+]
+
+로 계산되어 있다. 이건 독립성 가정이 들어간 근사다.
+
+코드에서는 반드시 sample-wise로 계산해야 한다.
+
+[
+\text{effective_succ}
+=====================
+
+\mathbb E[
+\mathbf 1(e_p<\rho_p)
+\land
+\mathbf 1(e_R<\rho_R)
+\land
+\mathbf 1(q\in Q)
+]
+]
+
+수정해야 할 코드 방향:
+
+```python
+pose_ok_55 = (pos_err < 0.05) & (rot_err_deg < 5.0)
+pose_ok_510 = (pos_err < 0.05) & (rot_err_deg < 10.0)
+
+joint_safe = (joint_violation_per_traj == 0)
+
+effective_succ55 = (pose_ok_55 & joint_safe).float().mean()
+effective_succ510 = (pose_ok_510 & joint_safe).float().mean()
+```
+
+추가로 기존 product estimate도 diagnostic으로만 남겨라.
+
+```python
+effective_succ510_product = pose_succ510 * (1.0 - jvio_rate)
+```
+
+최종 표에는 sample-wise exact 값을 써야 한다.
+
+---
+
+## 2.2 DP-bounded의 pose error 기준 확인
+
+가장 중요하다.
+
+DP-bounded가 예측한 pose (T_{\text{raw}})가 있고, bounded chart로부터 얻은 (q)가 있다면, 실제 실행 pose는:
+
+[
+T_{\text{exec}}=T_\phi(q,z_e)
 ]
 
 이다.
 
-v5.1 spec에서 healthy regime은 대략
+로봇에서 중요한 metric은 반드시:
 
 [
-|u|_\infty \lesssim 2
+e_T=\Log(T_{\text{exec}}^{-1}T_{\text{target}})
 ]
 
-이고, saturation concern은
+이어야 한다.
 
-[
-|u|_\infty > 3
-]
+수정 방향:
 
-이다. bounded chart에서 (|u|>3)이면 (D_\psi(u))가 near-singular가 되고, (J_Q=J_{\text{pose}}D_\psi)도 약해진다. v5.1 문서도 saturation regime을 주의해야 한다고 명시한다. 
+```python
+# Always evaluate executable pose
+q_exec = psi(u_pred)          # bounded chart
+T_exec = T_phi(q_exec, z_e)   # self-model / FK execution pose
 
-따라서 ours recipe는 endpoint success만 올리는 것이 아니라, saturation도 같이 제어해야 한다.
-
----
-
-## 2. 우선순위 결론
-
-지금 바로 할 일은 **50k 재학습이 아니다.**
-
-우선순위는 다음이다.
-
-```text
-1. current v5.1 50k checkpoint 고정
-2. sampling-time start/goal guidance 활성화
-3. chart-norm penalty 추가
-4. guidance recipe sweep
-5. 그 결과가 부족할 때 μ_pose > 0 재학습
+pos_err, rot_err = pose_error(T_exec, T_target)
 ```
 
-이유:
+그리고 raw pose를 예측하는 baseline은 별도 metric으로만 둬라.
 
-* start/goal guidance는 sampling-time mechanism이다.
-* 현재 checkpoint로 바로 sweep 가능하다.
-* endpoint refinement 부족을 가장 직접적으로 검증할 수 있다.
-* chart saturation도 sampling reward로 먼저 완화할 수 있다.
-* 재학습 전에 문제 원인을 분리할 수 있다.
+```python
+raw_pose_err = pose_error(T_raw, T_target)
+manifold_gap = pose_error(T_phi(q_exec, z_e), T_raw)
+```
 
----
+최종 비교 table에는:
 
-## 3. Step 1 — Current 50k checkpoint로 guidance sweep
+```text
+exec_pos_err
+exec_rot_err
+exec_pose_succ
+manifold_gap
+```
 
-### 3.1 Reward 구성
+를 넣어야 한다.
 
-Sampling에서 다음 reward를 사용한다.
-
-[
-R_{\text{total}}
-================
-
-\alpha_s R_{\text{start}}
-+
-\alpha_g R_{\text{goal}}
-+
-\alpha_u R_u
-+
-\alpha_v R_{\text{vel}}
-+
-\alpha_a R_{\text{acc}}
-]
-
-우선 recipe search에서는 핵심적으로 아래 세 항만 본다.
-
-[
-R_{\text{start}},\quad R_{\text{goal}},\quad R_u
-]
+보고서에서도 DP-bounded/DP 계열은 (T\neq T_\phi)라 manifold gap 비교에서 제외된다고 되어 있으므로, 이 부분은 반드시 명확히 audit해야 한다. 
 
 ---
 
-### 3.2 Start reward
+## 2.3 DP-bounded의 jvio 0.4% 원인 확인
+
+bounded chart가 제대로 적용되면 finite (u)에서:
 
 [
-e_{\text{start}}(u_0,z_e)
-=========================
-
-\Log_{\mathrm{SE}(3)}
-\left(
-\widetilde T_\phi(u_0,z_e)^{-1}
-T_{\text{start}}
-\right)
+q=\psi(u)\in(q_{\min},q_{\max})
 ]
 
-[
-R_{\text{start}}
-================
+이므로 waypoint 기준 jvio는 원칙적으로 0이어야 한다.
 
-*
+그런데 보고서의 200k 결과에서는 DP-bounded jvio=0.4%가 나온다. 
+이건 반드시 확인해야 한다.
 
-\left(
-\alpha_p^s |e_\rho^s|^2
-+
-\alpha_R^s |e_\omega^s|^2
-\right)
-]
+체크 항목:
+
+```python
+u = model_output
+q = chart.psi(u)
+
+assert torch.isfinite(u).all()
+assert torch.isfinite(q).all()
+
+min_margin = torch.minimum(q - q_min, q_max - q)
+```
+
+그리고 jvio를 세 가지로 분리해라.
+
+```python
+jvio_waypoint = (min_margin < -tol).any(dim=(-1, -2))
+jvio_tolerance = (min_margin < tol).any(dim=(-1, -2))
+jvio_nan = (~torch.isfinite(q)).any(dim=(-1, -2))
+```
+
+만약 waypoint jvio가 0인데 interpolation jvio가 0.4%라면, spline/interpolation 문제다.
+만약 waypoint에서도 0.4%라면 DP-bounded eval path에서 chart wrapping이 빠졌거나 tolerance가 잘못된 것이다.
 
 ---
 
-### 3.3 Goal reward
+# 3. v5.1 gap의 핵심 코드 수정 후보
 
-[
-e_{\text{goal}}(u_H,z_e)
-========================
+현재 v5.1이 DP-bounded보다 밀리는 주된 현상은 다음이다.
 
-\Log_{\mathrm{SE}(3)}
-\left(
-\widetilde T_\phi(u_H,z_e)^{-1}
-T_{\text{target}}
-\right)
-]
+* v5.1: succ510 ceiling 약 85–87%
+* DP-bounded: effective succ510 약 94%
+* v5.1은 (|u|_\infty^{p99}\approx3.5), sat>3 약 37%
+* sampling-time guidance/R_u는 거의 효과 없음
 
-[
-R_{\text{goal}}
-===============
+보고서도 v5.1의 sampling-time mechanism으로는 DP-bounded와의 gap을 닫지 못했고, chart saturation이 training-time 현상이라고 정리한다. 
 
-*
-
-\left(
-\alpha_p^g |e_\rho^g|^2
-+
-\alpha_R^g |e_\omega^g|^2
-\right)
-]
+따라서 수정은 sampling이 아니라 **chart parameterization / training input / prediction target** 쪽이어야 한다.
 
 ---
 
-### 3.4 Chart-norm penalty
+# 4. 수정 후보 1순위: chart temperature 추가
 
-현재 chart saturation이 있으므로 (R_u)를 반드시 같이 넣는다.
-
-[
-R_u
-===
-
-*
-
-\sum_{h=0}^{H}
-|u_h|^2
-]
-
-목적:
+현재 bounded chart가 아마:
 
 [
-|u|_\infty^{p99}
+q=q_{\text{mid}}+\frac{q_{\text{range}}}{2}\tanh u
 ]
 
-를 3.0 아래로 낮추는 것.
-
----
-
-## 4. First sweep grid
-
-우선 (\alpha_s=2\alpha_g)로 고정한다.
-
-v5.1 spec에서도 start anchor를 goal보다 강하게 두는 것을 권장한다. 즉,
-
-[
-\alpha_s \ge 2\alpha_g
-]
-
-를 기본 recipe로 둔다. 
-
-### First sweep
-
-| Config | (\alpha_g) | (\alpha_s) | (\alpha_u) | 목적                        |
-| ------ | ---------: | ---------: | ---------: | ------------------------- |
-| G0     |          0 |          0 |          0 | current baseline          |
-| G1     |        0.5 |        1.0 |          0 | mild guidance             |
-| G2     |        1.0 |        2.0 |          0 | spec default              |
-| G3     |        2.0 |        4.0 |          0 | strong guidance           |
-| G4     |        0.5 |        1.0 |  (10^{-3}) | mild + anti-saturation    |
-| G5     |        1.0 |        2.0 |  (10^{-3}) | default + anti-saturation |
-| G6     |        2.0 |        4.0 |  (10^{-3}) | strong + anti-saturation  |
-| G7     |        1.0 |        2.0 |  (10^{-2}) | stronger anti-saturation  |
-| G8     |        2.0 |        4.0 |  (10^{-2}) | aggressive                |
-
----
-
-## 5. Selection criteria
-
-Recipe 선택 시 최고 success만 보면 안 된다. saturation을 같이 봐야 한다.
-
-### Primary metrics
-
-| Metric             |                     목표 |
-| ------------------ | ---------------------: |
-| succ@(5cm,5°)      |         17.6% → 35% 이상 |
-| succ@(5cm,10°)     |         47.3% → 60% 이상 |
-| pos err            |             5.73 cm 이하 |
-| rot err            |               8.15° 이하 |
-| mode capture error |                   0 유지 |
-| joint violation    |                   0 유지 |
-| manifold gap       |                   0 유지 |
-| (|u|_\infty^{p99}) | 3.0 이하, ideally 2.5 이하 |
-
-### Selection rule
+라면, saturation을 늦추기 위해 다음을 추가해라.
 
 [
 \boxed{
-\text{success가 약간 낮더라도 } |u|_\infty^{p99}<3.0 \text{인 config를 우선한다.}
+q=q_{\text{mid}}+\frac{q_{\text{range}}}{2}\tanh\left(\frac{u}{c}\right)
 }
 ]
 
-이유:
+여기서 (c>1).
 
-* (|u|_\infty^{p99}>3)이면 bounded chart saturation regime이다.
-* (D_\psi(u))가 작아지고, pose gradient가 약해질 수 있다.
-* 후속 (\mu_{\text{pose}}) 재학습을 해도 saturation이 심하면 endpoint refinement가 어려울 수 있다.
+코드 수정 위치는 bounded chart class, 아마 `TanhBoundedChart` 또는 `BoundedChartPoseManifold` 내부의 `psi`, `psi_inv`, `Dpsi`.
 
----
+구현:
 
-## 6. Step 2 — Local ratio sweep
+```python
+class TanhBoundedChart:
+    def __init__(self, q_min, q_max, chart_temp: float = 1.0):
+        self.q_min = q_min
+        self.q_max = q_max
+        self.q_mid = 0.5 * (q_min + q_max)
+        self.q_half = 0.5 * (q_max - q_min)
+        self.chart_temp = chart_temp
 
-First sweep에서 best config가 나오면, 그 주변에서만 (\alpha_s/\alpha_g) ratio를 본다.
+    def psi(self, u):
+        c = self.chart_temp
+        return self.q_mid + self.q_half * torch.tanh(u / c)
 
-예를 들어 G5가 best라면:
+    def psi_inv(self, q, eps=1e-6):
+        y = (q - self.q_mid) / self.q_half
+        y = y.clamp(-1 + eps, 1 - eps)
+        c = self.chart_temp
+        return c * torch.atanh(y)
 
-[
-\alpha_g=1.0,\quad \alpha_u=10^{-3}
-]
-
-를 고정하고,
-
-[
-\alpha_s/\alpha_g\in{1,2,4}
-]
-
-만 본다.
-
-| Config | (\alpha_g) | (\alpha_s) | (\alpha_u) |
-| ------ | ---------: | ---------: | ---------: |
-| R1     |        1.0 |        1.0 |  (10^{-3}) |
-| R2     |        1.0 |        2.0 |  (10^{-3}) |
-| R3     |        1.0 |        4.0 |  (10^{-3}) |
-
-목적:
-
-* start anchor가 너무 약한지 확인
-* start anchor가 너무 강해서 trajectory를 망치는지 확인
-* endpoint success와 smoothness 사이의 trade-off 확인
-
----
-
-## 7. Step 3 — Guidance로 부족하면 (\mu_{\text{pose}}) 재학습
-
-Guidance sweep 결과가 다음 중 하나라면 재학습으로 넘어간다.
-
-```text
-- succ@(5cm,5°)가 30% 아래
-- rot err가 거의 줄지 않음
-- guidance를 키우면 saturation만 악화됨
-- mode는 맞는데 endpoint만 계속 부정확함
+    def dpsi_du(self, u):
+        c = self.chart_temp
+        z = u / c
+        return (self.q_half / c) * (1.0 / torch.cosh(z).pow(2))
 ```
 
-그때는 training-time pose consistency signal이 부족한 것이다.
+실험 sweep:
+
+```text
+chart_temp c ∈ {1.0, 1.5, 2.0}
+```
+
+목표:
+
+```text
+sat>3 rate: 37% → <10%
+u_p99: 3.5 → preferably <3
+succ510: 85% → closer to DP-bounded 94%
+```
+
+주의:
+
+* (D\psi) scale이 바뀌므로 `G_Q`, `J^Q`, `psi_inv(q_init)` 모두 같은 temp를 써야 한다.
+* checkpoint와 eval config에 `chart_temp`를 저장해야 한다.
+* DP-bounded도 같은 chart_temp로 평가해야 fair하다.
 
 ---
 
-## 8. μ_pose 재학습 recipe
+# 5. 수정 후보 2순위: endpoint-relative pose error를 input channel로 추가
 
-첫 재학습은 하나만 한다.
+현재 v5.1이 DP-bounded보다 endpoint precision이 낮다면, score network가 target-relative geometry를 충분히 못 보고 있을 가능성이 있다.
 
-[
-\boxed{
-\beta_f=20,\quad
-\bar G_Q=I,\quad
-\mu_{\text{pose}}=0.1,\quad
-\tau_{\text{cutoff}}=0.5,\quad
-50k
-}
-]
-
-sampling은 Step 1/2에서 찾은 best guidance setting을 그대로 사용한다.
-
----
-
-### 8.1 Pose regularizer
-
-v5.1에서 pose term은 exact DSM target이 아니라 auxiliary pose-geometric consistency regularizer로 정의된다. 이는 (T=\widetilde T_\phi(u,z_e))가 (u)의 deterministic graph output이기 때문이다. 
+각 timestep (h)에서 현재 predicted pose와 target pose의 relative error를 input으로 넣어라.
 
 [
-\mathcal L_{\text{pose}}
-========================
-
-\mathbb E
-\left[
-\lambda_p(r)
-\sum_h
-\left|
-J_Q(u_{h,r},z_e)s_{\theta,h}^u
-------------------------------
-
-\frac{1}{\tau(r)}
-\Log_{\mathrm{SE}(3)}
-\left(
-\widetilde T_\phi(u_{h,r})^{-1}
-\widetilde T_\phi(u_{h,0})
-\right)
-\right|_W^2
-\right]
-]
-
-Total loss:
-
-[
-\mathcal L
+e_h^{goal}
 ==========
 
-\mathcal L_{\text{score}}
-+
-\mu_{\text{pose}}\mathcal L_{\text{pose}}
+\Log_{SE(3)}
+\left(
+T_\phi(q_h,z_e)^{-1}T_{\text{goal}}
+\right)
+\in\mathbb R^6
 ]
 
----
-
-### 8.2 μ_pose sweep
-
-(\mu_{\text{pose}}=0.1)이 효과가 있으면 다음 sweep으로 확장한다.
+start도 가능하다.
 
 [
-\mu_{\text{pose}}\in{0.05,0.1,0.3}
+e_h^{start}
+===========
+
+\Log_{SE(3)}
+\left(
+T_\phi(q_h,z_e)^{-1}T_{\text{start}}
+\right)
 ]
 
-| (\mu_{\text{pose}}) | 예상                                    |
-| ------------------: | ------------------------------------- |
-|                0.05 | 안정적이지만 약할 수 있음                        |
-|                 0.1 | 첫 후보                                  |
-|                 0.3 | endpoint 개선 가능, mode/smoothness 손상 위험 |
-|                 1.0 | 현재 단계에서는 과함                           |
+우선 goal error만 추천한다.
 
----
+코드 위치:
 
-## 9. Step 4 — 그래도 부족하면 (\beta_f=10)
+* `TrajectoryScoreNetUNetPose.forward`
+* conditioning channel concat 부분
+* `goal_cond_dim` 계산 부분
 
-현재 (\beta_f=20)은 매우 clean하다.
+추가 feature:
 
-[
-\alpha(K)\approx0.0067
-]
-
-즉, 거의 pure stationary prior에서 복원해야 한다.
-
-장점:
-
-* IK-free stationary reference claim이 가장 깨끗함.
-* (p_K)와 (p_{\text{ref}}) mismatch가 작음.
-
-단점:
-
-* denoising 난이도가 높음.
-* endpoint precision이 떨어질 수 있음.
-
-만약 guidance + (\mu_{\text{pose}})로도 success가 부족하면:
-
-[
-\boxed{\beta_f=10}
-]
-
-을 시도한다.
-
-[
-\alpha(K)\approx0.082
-]
-
-즉, forward terminal distribution에 data dependence가 조금 더 남는다. 학습은 쉬워질 수 있지만, finite-(K) mismatch는 커진다.
-
-따라서 (\beta_f=10) 실험에서는 반드시 다음을 보고해야 한다.
-
-[
-W_2(p_K,p_{\text{ref}})
-]
-
-또는
-
-[
-\mathrm{KL}(p_K|p_{\text{ref}})
-]
-
----
-
-## 10. Step 5 — Best recipe로 longer training
-
-Best recipe가 잡힌 뒤에만 longer training을 한다.
-
-순서:
-
-```text
-1. best guidance recipe
-2. best μ_pose
-3. best β_f
-4. 100k training
-5. 200k training
+```python
+T_cur = manifold.T_phi_Rp(q_h, z_e)
+e_goal = se3_log(inv(T_cur) @ T_goal)  # (B,H,6)
 ```
 
-무작정 100k/200k를 먼저 가면 원인 분리가 안 된다.
+UNet input channel에 concat:
 
----
-
-## 11. Full recipe-search order
-
-최종 순서는 다음이다.
-
-```text
-Step 1.
-current v5.1 50k checkpoint
-→ start/goal guidance + chart-norm penalty sampling sweep
-
-Step 2.
-best 주변에서 α_s/α_g local ratio sweep
-
-Step 3.
-guidance로 부족하면 μ_pose=0.1, 50k retrain
-
-Step 4.
-μ_pose ∈ {0.05, 0.1, 0.3} sweep
-
-Step 5.
-그래도 부족하면 β_f=10 ablation
-
-Step 6.
-best recipe로 100k / 200k longer training
+```python
+x_in = torch.cat([
+    u_or_q,
+    time_embed_per_step,
+    horizon_embed,
+    z_e_channel,
+    goal_error_se3,     # new 6 channels
+], dim=channel_dim)
 ```
 
+이 수정은 v5.1에 특히 잘 맞는다. 왜냐하면 v5.1은 IK seed 없이 (T_{\text{start}},T_{\text{goal}},z_e)만으로 endpoint를 맞춰야 하므로, target-relative error를 직접 주는 것이 score field 학습을 돕는다.
+
 ---
 
-## 12. Expected outcomes and interpretation
+# 6. 수정 후보 3순위: (x_0)-prediction head 추가
 
-### Case A — Guidance만으로 success가 크게 회복됨
+v5.1은 OU forward가 closed-form이다.
+
+[
+u_r=\alpha u_0+\sigma \epsilon
+]
+
+그러면 score prediction만 하지 말고 (u_0)-prediction도 추가할 수 있다.
+
+[
+\hat u_0=f_\theta(u_r,r,c,z_e)
+]
+
+DP 계열이 잘 되는 이유 중 하나는 (\epsilon)-prediction / denoised prediction이 안정적이기 때문이다. v5.1의 score-only target이 endpoint precision에서 약하다면, (x_0)-head를 auxiliary로 넣는 것이 좋다.
+
+추가 loss:
+
+[
+L_{x0}
+======
+
+|\hat u_0-u_0|^2
+]
+
+또는 chart metric weighted:
+
+[
+L_{x0}
+======
+
+(\hat u_0-u_0)^T\bar G_Q(\hat u_0-u_0)
+]
+
+그리고 pose-level denoised loss:
+
+[
+L_{\text{pose-x0}}
+==================
+
+\left|
+\Log_{SE(3)}
+\left(
+T_\phi(\psi(\hat u_0),z_e)^{-1}
+T_\phi(\psi(u_0),z_e)
+\right)
+\right|_W^2
+]
+
+주의: 이전 (L_{\text{pose}})는 score vector (J^Qs_\theta)에 걸어서 exact OU target과 충돌했다.
+여기서는 denoised state (\hat u_0)에 걸기 때문에 훨씬 정합적이다.
+
+---
+
+# 7. 수정 후보 4순위: training-time saturation weighting
+
+sampling-time (R_u)는 실패했다. 그러면 training-time에서 saturation region을 더 잘 학습하게 해야 한다.
+
+단순히 (R_u)를 크게 넣기보다, score loss weight를 saturation region에서 높이는 게 덜 위험하다.
 
 예:
 
-```text
-succ@(5cm,5°): 17.6% → 40%+
-succ@(5cm,10°): 47.3% → 60%+
-‖u‖∞ p99 < 3.0
-mfe = 0
-jvio = 0
+[
+w_{\text{sat}}(u_0)
+===================
+
+1+\lambda\cdot \operatorname{sigmoid}(k(|u_0|*\infty-u*{\text{thr}}))
+]
+
+코드:
+
+```python
+u_norm = u0.abs().amax(dim=(-1, -2))  # per trajectory
+w_sat = 1.0 + lam * torch.sigmoid(k * (u_norm - u_thr))
+loss = (w_sat * loss_per_traj).mean()
 ```
 
-해석:
+추천 sweep:
 
-> v5.1 score model은 mode와 trajectory prior는 잘 학습했고, 부족했던 것은 endpoint refinement였다.
-> start/goal guidance가 IK seed의 non-cheating 대체 역할을 한다.
+```text
+u_thr = 2.5
+lambda ∈ {0.5, 1.0, 2.0}
+k = 5
+```
+
+목표는 (u)-saturation sample의 score quality를 올리는 것이지, sample을 억지로 중앙으로 당기는 것이 아니다.
 
 ---
 
-### Case B — Guidance를 키우면 success는 오르지만 saturation이 악화됨
+# 8. 수정 후보 5순위: DP-bounded와 같은 prediction target으로 맞추기
 
-예:
+현재 DP-bounded가 DDPM (\epsilon)-prediction으로 잘 되고, v5.1은 score convention으로 간다.
+
+v5.1도 OU forward를 쓰므로 다음 prediction target 중 하나로 바꿀 수 있다.
 
 ```text
-succ 상승
-‖u‖∞ p99 > 4
+score prediction
+epsilon prediction
+x0 prediction
+v prediction
 ```
 
-해석:
+비교 실험을 만들면 좋다.
 
-> endpoint로 가기 위해 chart boundary를 과도하게 사용하고 있다.
-> (R_u) 또는 velocity/acceleration regularization이 필요하다.
+OU 관계:
 
-대응:
+[
+u_r=\alpha u_0+\sigma \epsilon
+]
+
+[
+\epsilon=\frac{u_r-\alpha u_0}{\sigma}
+]
+
+score target:
+
+[
+s^*=-\frac{\bar G_Q(u_r-\alpha u_0)}{\sigma^2}
+==============================================
+
+-\frac{1}{\sigma}\bar G_Q\epsilon
+]
+
+만약 DP-bounded가 (\epsilon)-prediction이라면 v5.1도 (\epsilon)-prediction으로 맞춰야 fair한 ablation이 된다.
+
+---
+
+# 9. 당장 하지 말아야 할 수정
+
+## 9.1 (L_{\text{pose}}) 재시도
+
+이미 결론이 나온 상태다.
+
+* raw form: small-(\tau) divergence
+* tau-scaled + (\mu=0.1): loss dominates
+* (\mu=10^{-3}): baseline보다 후퇴
+* 보고서에서도 (L_{\text{pose}}) minimizer가 exact OU score minimizer와 다르므로 (\mu_{\text{pose}}>0) 경로 폐기라고 정리했다. 
+
+따라서 다시 하지 마라.
+
+## 9.2 sampling-time guidance 더 세게
+
+이미 G0–G8 sweep에서 ceiling을 못 깼다. 강한 (R_u)는 오히려 악화했다. 
+
+## 9.3 무작정 300k/500k 학습
+
+200k에서 plateau가 보이고, v5.1은 175k peak 후 200k에서 약간 후퇴했다. 먼저 구조 수정이 맞다. 
+
+---
+
+# 10. 가장 추천하는 실행 순서
+
+## Phase 0 — 평가 audit
+
+1. exact effective success 구현
+2. DP-bounded jvio 0.4% 원인 확인
+3. DP-bounded pose error가 (T_\phi(q)) 기준인지 확인
+4. demo/gen (u)-saturation histogram 출력
+
+## Phase 1 — chart temperature
 
 ```text
-α_u 증가
-velocity/acceleration reward 활성화
-guidance strength 감소
-μ_pose 재학습 검토
+chart_temp = 1.5
+chart_temp = 2.0
+```
+
+각각 100k 먼저.
+성능 좋으면 200k.
+
+## Phase 2 — endpoint-relative input
+
+goal SE(3) error 6D channel 추가.
+
+```text
+input += Log_SE3(T_phi(q_h,z_e)^-1 T_goal)
+```
+
+100k.
+
+## Phase 3 — v5.1 target ablation
+
+```text
+score prediction vs epsilon prediction vs x0 prediction
+```
+
+가능하면 chart_temp best setting 위에서.
+
+## Phase 4 — 3-seed only for finalists
+
+최종 후보 2개만 3-seed.
+
+* DP-bounded best
+* v5.1 best modified
+
+---
+
+# 11. 간단한 TODO Markdown
+
+```markdown
+# SMCDP Code TODO — Gap to DP-bounded
+
+## A. Evaluation audit
+- [ ] Replace product effective_succ = succ × (1-jvio) with sample-wise exact effective_succ.
+- [ ] Split pose metrics into raw_pose_err and exec_pose_err = error(T_phi(q), T_target).
+- [ ] Verify DP-bounded pose success uses exec_pose_err, not raw predicted T.
+- [ ] Debug DP-bounded jvio=0.4% despite bounded chart.
+- [ ] Add waypoint-jvio / interpolation-jvio / NaN-jvio breakdown.
+- [ ] Add demo vs generated u-norm histogram: p50/p90/p99, sat>2, sat>3.
+
+## B. Chart saturation fix
+- [ ] Add chart_temp c to bounded chart:
+      q = q_mid + q_half * tanh(u / c)
+- [ ] Update psi_inv:
+      u = c * atanh((q-q_mid)/q_half)
+- [ ] Update Dpsi:
+      Dpsi = (q_half / c) * sech^2(u/c)
+- [ ] Save chart_temp in ckpt config and eval config.
+- [ ] Sweep c ∈ {1.0, 1.5, 2.0}.
+- [ ] Compare sat>3, pos_err, rot_err, succ510.
+
+## C. Endpoint-relative conditioning
+- [ ] Compute per-step goal error:
+      e_goal_h = Log_SE3(T_phi(q_h,z_e)^-1 T_goal)
+- [ ] Add e_goal_h as 6D channel to v5.1 score net input.
+- [ ] Optional: add start error e_start_h.
+- [ ] Run 100k comparison vs baseline v5.1.
+
+## D. Prediction target ablation
+- [ ] Add epsilon-prediction target for v5.1 OU:
+      eps = (u_r - alpha*u_0) / sigma
+- [ ] Add x0-prediction head:
+      u0_hat = f_theta(u_r,r,c,z_e)
+- [ ] Add optional denoised pose loss on u0_hat, not on score vector.
+- [ ] Compare score-pred / eps-pred / x0-pred.
+
+## E. Do not repeat
+- [ ] Do not retry L_pose = ||JQs - Log/tau||.
+- [ ] Do not retry mu_pose > 0 unless using x0-prediction pose loss.
+- [ ] Do not spend more compute on sampling-time guidance/R_u sweep before training-time fixes.
+- [ ] Do not run 300k+ until chart_temp / endpoint conditioning are tested.
 ```
 
 ---
 
-### Case C — Guidance가 거의 안 먹힘
+# 12. 최종 판단
 
-예:
-
-```text
-succ@(5cm,5°) < 30%
-rot err 감소 없음
-```
-
-해석:
-
-> score field 자체가 endpoint pose tangent와 충분히 정렬되지 않았다.
-> training-time pose consistency signal이 필요하다.
-
-대응:
-
-```text
-μ_pose=0.1 retrain
-```
-
----
-
-### Case D — μ_pose도 부족함
-
-해석:
-
-> β_f=20의 denoising 난이도가 너무 높거나, model capacity/training steps가 부족하다.
-
-대응:
-
-```text
-β_f=10 ablation
-100k/200k training
-network capacity 증가
-```
-
----
-
-## 13. Current recommendation
-
-지금 바로 실행할 것은 다음 하나다.
+현재 코드에서 가장 의심되는 “잘못”은 수식 구현 오류라기보다 다음이다.
 
 [
 \boxed{
-\textbf{current v5.1 50k checkpoint에서 guidance + } R_u \textbf{ sampling sweep}
+\text{bounded chart의 tanh saturation이 v5.1 학습을 어렵게 만들고, score net이 endpoint-relative geometry를 충분히 직접 보지 못하는 것}
 }
 ]
 
-구체적으로는 G1–G8을 먼저 돌린다.
+따라서 가장 중요한 코드 수정은:
 
-가장 먼저 확인해야 할 것은:
+1. **metric audit**
+2. **chart temperature**
+3. **goal-relative SE(3) error input**
+4. **epsilon/x0 prediction target ablation**
 
-```text
-1. succ@(5cm,5°)가 35% 이상으로 회복되는가?
-2. succ@(5cm,10°)가 60% 이상으로 회복되는가?
-3. ‖u‖∞ p99가 3.0 이하로 내려가는가?
-4. mfe=0이 유지되는가?
-5. jvio=0이 유지되는가?
-```
+순서다.
 
-이 결과가 나온 뒤에 (\mu_{\text{pose}}) 재학습 여부를 결정한다.
+DP-bounded는 **Diffusion Policy 논문의 conditional action diffusion baseline을 네 task에 맞게 bounded chart로 강화한 adapted baseline**이다. 원 논문의 공식 baseline이라기보다, 네 논문에서 반드시 이겨야 하는 **강한 내부 baseline**으로 보는 것이 정확하다.
 
----
-
-## 14. One-line summary
-
-현재 단계의 최우선 목표는 재학습이 아니라, **IK-free v5.1 checkpoint에서 start/goal guidance와 chart-norm penalty를 켜서 endpoint refinement와 saturation control이 가능한지 확인하는 것**이다.
-
-```
-```
+[1]: https://arxiv.org/abs/2303.04137?utm_source=chatgpt.com "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"

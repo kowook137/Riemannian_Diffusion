@@ -89,11 +89,16 @@ def main():
 
     if a.get("bounded_chart", False):
         arm = BoundedChartPoseManifold(
-            arm, make_chart_from_manifold(arm, bounded=True),
+            arm,
+            make_chart_from_manifold(
+                arm, bounded=True,
+                chart_temp=float(a.get("chart_temp", 1.0)),
+            ),
             lambda_floor=float(a.get("lambda_floor", 1e-4)),
         )
         print(f"[bounded-chart] eval-side wrap enabled "
-              f"(lambda_floor={a.get('lambda_floor', 1e-4):.1e})")
+              f"(chart_temp={a.get('chart_temp', 1.0):.2f}, "
+              f"lambda_floor={a.get('lambda_floor', 1e-4):.1e})")
 
     H1 = a["H"] + 1
     n_q, n_T = 7, 7
