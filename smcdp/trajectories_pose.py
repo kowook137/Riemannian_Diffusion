@@ -1259,19 +1259,28 @@ def traj_pose_consistency_loss(
     tau_cutoff: float = 0.5,                                                    # spec §10 default
     goal_cond: Optional[Tensor] = None,
     _shared: Optional[dict] = None,                                             # internal: share r, tau_r, s_chart
+    tau_scaled: bool = True,                                                    # NUMERICALLY STABLE: ‖τ Js - Log‖² instead of ‖Js - Log/τ‖²
 ) -> Tensor:
     """Auxiliary pose-geometric consistency regularizer (v5.1 §10).
 
-        L_pose = E_{r, u_0, u_r} [ λ_p(r) · Σ_h ‖J^Q(u_{h,r}, z_e) · s_θ^u_h
-                                              - (1/τ(r)) Log_SE3(T̃_φ(u_{h,r})^{-1} T̃_φ(u_{h,0}))‖²_W ]
-        λ_p(r) = 1[τ(r) < τ_cutoff],   τ_cutoff ≈ 0.5      (down-weights large-r where Varadhan breaks)
+    Spec form (`tau_scaled=False`):
+        L_pose_spec = E[λ_p · Σ_h ‖J^Q s_θ - (1/τ) Log_SE3(T̃_φ(u_r)^{-1} T̃_φ(u_0))‖²_W]
 
-    The pose component is NOT an exact transition score (since T̃_φ is a
-    deterministic function of u, so the u-OU does NOT induce a closed-form
-    Gaussian on T).  This term is retained as a Varadhan-style consistency
-    prior, valid in the small-r regime — see spec §10 "Validity regime".
+    Numerically-stable equivalent (`tau_scaled=True`, default):
+        L_pose_scaled = E[λ_p · Σ_h ‖τ J^Q s_θ - Log_SE3(...)‖²_W]
+                      = E[λ_p · τ² · (spec-form residual squared)]
 
-    Added to L_score with factor μ_pose (default 0).
+    The two forms share the SAME minimizer (multiply residual by τ, square,
+    optimizer minimum unchanged at Js = Log/τ).  The scaled form avoids the
+    Varadhan asymptotic blow-up:  at small r, Log_SE3 ~ O(√τ) and τ·Js_θ at
+    the ideal-solution s_θ=ε/σ is also O(√τ), so residual is well-behaved.
+    The spec form has target Log/τ ~ O(1/√τ) which causes L_pose to diverge
+    during training when s_θ is far from ideal (loss ~ 1/τ in r-integral
+    near r=0, dominates L_score by orders of magnitude).
+
+    λ_p(r) = 1[τ(r) < τ_cutoff],   τ_cutoff ≈ 0.5  (down-weights large-r
+    where Varadhan small-displacement assumption breaks).  Added to
+    L_score with factor μ_pose (default 0).
     """
     manifold = sde.manifold
     schedule = sde.schedule
@@ -1315,11 +1324,16 @@ def traj_pose_consistency_loss(
 
     tau_brown = schedule.tau(r).clamp(min=1e-12)                                # (B,)
     tau_per_h = tau_brown.view(B, 1).expand(B, H1).reshape(B * H1, 1)            # (B*H1, 1)
-    target_pose = xi / tau_per_h                                                # (B*H1, 6)
 
     W = manifold._W_diag(u_r_flat)                                              # (6,)
-    diff = Js_flat - target_pose                                                # (B*H1, 6)
-    sq_per_pt = (diff * diff * W.unsqueeze(0)).sum(-1).reshape(B, H1)           # (B, H+1)
+    if tau_scaled:
+        # Stable form: residual = τ · J^Q s_θ − Log_SE3
+        residual = tau_per_h * Js_flat - xi                                     # (B*H1, 6)
+    else:
+        # Spec form: residual = J^Q s_θ − Log_SE3 / τ  (diverges at small τ)
+        target_pose = xi / tau_per_h                                            # (B*H1, 6)
+        residual = Js_flat - target_pose                                        # (B*H1, 6)
+    sq_per_pt = (residual * residual * W.unsqueeze(0)).sum(-1).reshape(B, H1)   # (B, H+1)
     sq_per_traj = sq_per_pt.sum(-1)                                             # (B,)
 
     # Indicator down-weight  λ_p(r) = 1[τ(r) < τ_cutoff]
@@ -1340,6 +1354,7 @@ def traj_total_loss_v51_pose(
     endpoint_weight: float = 1.0,
     mu_pose: float = 0.0,
     tau_cutoff: float = 0.5,
+    pose_tau_scaled: bool = True,                                               # NUMERICALLY STABLE form (default)
 ) -> Tensor:
     """v5.1 total loss: L = L_score + μ_pose · L_pose   (spec §10).
 
@@ -1347,6 +1362,10 @@ def traj_total_loss_v51_pose(
     matching baseline).  When μ_pose > 0, the r-sample, u_r noise, and
     network score are shared between the two terms for efficiency — both
     losses observe the SAME forward sample so their gradients are coherent.
+
+    `pose_tau_scaled=True` (default) uses the numerically-stable form
+    ‖τ J^Q s_θ - Log_SE3‖²_W (same minimizer as the spec form ‖Js - Log/τ‖²,
+    but no 1/τ divergence at small r — see traj_pose_consistency_loss docs).
     """
     if mu_pose == 0.0:
         return traj_ou_score_loss_pose(
@@ -1363,7 +1382,7 @@ def traj_total_loss_v51_pose(
     )
     L_pose = traj_pose_consistency_loss(
         score_fn, sde, tau_0, eps=eps, tau_cutoff=tau_cutoff,
-        goal_cond=goal_cond, _shared=shared,
+        goal_cond=goal_cond, _shared=shared, tau_scaled=pose_tau_scaled,
     )
     return L_score + mu_pose * L_pose
 
