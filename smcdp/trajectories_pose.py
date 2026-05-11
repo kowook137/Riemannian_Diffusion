@@ -731,6 +731,43 @@ def _smoothness_guidance_chart(
     return -G_inv_grad                                                          # ∇_M R_smooth
 
 
+def _chart_norm_penalty_chart(
+    tau: Tensor,                                                                # (B, H+1, ambient_dim_pose)
+    manifold,
+    alpha_u: float,
+) -> Tensor:
+    """Chart-norm penalty (joint_limit_extension v5.1 diagnostic_plan §3.4).
+
+        R_u(τ) = -α_u · Σ_{h=0..H} ‖u_h‖²
+        ∂R_u/∂u_h = -2 α_u u_h        (negative because R is a reward)
+
+    Returns the natural-gradient ascent direction on R_u in chart form:
+        ∇_M R_u  =  -G_Q^{-1} · ∂(-R_u)/∂u  =  -G_Q^{-1} · 2 α_u u_h
+    consistent with the convention used by `_pose_anchor_guidance_chart` and
+    `_smoothness_guidance_chart` (returns the term to be added to s_θ in the
+    reverse step).
+
+    Purpose: push samples away from the bounded-chart saturation regime
+    (‖u‖_∞ > 3) where D_ψ(u) ≈ 0 and the chart Jacobian degenerates.
+    """
+    if alpha_u == 0.0:
+        B, H1, _ = tau.shape
+        return torch.zeros(B, H1, manifold.n_q, device=tau.device, dtype=tau.dtype)
+    B, H1, _ = tau.shape
+    n_q = manifold.n_q
+    u = tau[..., :n_q]                                                          # (B, H+1, n_q)
+    z = tau[..., n_q + 7:]
+    # ∂(α_u ‖u‖²) / ∂u = 2 α_u u
+    chart_grad = 2.0 * alpha_u * u                                              # (B, H+1, n_q)
+    u_flat = u.reshape(B * H1, n_q)
+    z_flat = z.reshape(B * H1, -1)
+    L = manifold.G_pose_chol(u_flat, z_flat)
+    G_inv_grad = torch.cholesky_solve(
+        chart_grad.reshape(B * H1, n_q, 1), L,
+    ).squeeze(-1).reshape(B, H1, n_q)
+    return -G_inv_grad                                                          # ∇_M R_u  (R_u itself is negative-definite)
+
+
 # =====================================================================
 # Reverse-time GRW sampler on the pose manifold (chart form)
 # =====================================================================
@@ -1360,6 +1397,7 @@ def traj_reverse_ou_chart_pose(
     smoothness_alpha_vel: float = 0.0,
     smoothness_alpha_acc: float = 0.0,
     smoothness_chart_form: str = "q",
+    chart_norm_alpha: float = 0.0,
 ) -> Tensor:
     """Reverse-time chart-space OU sampler with graph retraction (v5.1 §11).
 
@@ -1448,6 +1486,8 @@ def traj_reverse_ou_chart_pose(
                 alpha_acc=smoothness_alpha_acc,
                 chart_form=smoothness_chart_form,
             )
+        if chart_norm_alpha > 0.0:
+            s = s + _chart_norm_penalty_chart(x, manifold, alpha_u=chart_norm_alpha)
 
         # ---- Ḡ_Q^{-1} (score + guidance) ----
         gbar_inv_s = sde.gbar_inv_apply(s)                                      # (B, H+1, n_q)
