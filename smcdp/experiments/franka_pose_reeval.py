@@ -164,7 +164,7 @@ def main():
                        if alpha_g is not None else a.get("goal_alpha_R", 0.0))
             samples = traj_reverse_ou_chart_pose(
                 sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
-                n_steps=a["n_sample_steps"], goal_cond=goal_cond, z_e=z_e,
+                n_steps=n_sample_steps_eff, goal_cond=goal_cond, z_e=z_e,
                 eps=a["eps"], device=device, dtype=dtype,
                 T_start_Rp=T_start_Rp,
                 start_alpha_p=start_ap, start_alpha_R=start_aR,
@@ -181,7 +181,7 @@ def main():
                            if a.get("method_a") else None)
             samples = traj_reverse_grw_pose(
                 sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
-                n_steps=a["n_sample_steps"], goal_cond=goal_cond, z_e=z_e,
+                n_steps=n_sample_steps_eff, goal_cond=goal_cond, z_e=z_e,
                 limiting_q_mean=torch.tensor(a["limiting_mean_q"]),
                 q_init=q_init_eval, limiting_scale=a.get("limiting_scale"),
                 eps=a["eps"], device=device, dtype=dtype,
