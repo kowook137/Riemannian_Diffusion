@@ -37,6 +37,9 @@ from smcdp.trajectories_pose import (
     TrajectoryScoreNetUNetPose, TrajectoryScaledScoreFnPose,
     PoseLangevinSDE,
     traj_dsm_pose_loss, traj_reverse_grw_pose,
+    # joint_limit_extension v5.1: chart-space OU SDE
+    PoseChartOUSDE,
+    traj_total_loss_v51_pose, traj_reverse_ou_chart_pose,
 )
 from smcdp.lie_se3 import (
     log_relative_Rp, quat_to_R, R_to_quat, exp_SE3, compose_Rp,
@@ -163,6 +166,43 @@ def parse_args():
                         "under Choice A (G_Q^A >= I globally) but retained for "
                         "arithmetic underflow safety.  Active only when "
                         "--bounded-chart is set.")
+    # joint_limit_extension v5.1 — chart-space OU (replaces v4.1 Brownian + IK seed)
+    p.add_argument("--use-v51", action="store_true",
+                   help="v5.1: enable chart-space OU SDE pipeline "
+                        "(joint_limit_extension.tex v5.1 §8-§11).  Replaces "
+                        "the v4.1 drift-free Brownian forward + per-trajectory "
+                        "IK-derived q_init with: (a) closed-form OU transition "
+                        "p_{r|0} = N(alpha u_0, sigma^2 Gbar^{-1}), (b) exact "
+                        "Euclidean OU score target (no Varadhan approximation), "
+                        "(c) IK-free reference distribution N(0, Gbar^{-1}). "
+                        "Recommended with --bounded-chart for joint feasibility.")
+    p.add_argument("--gbar-mode", type=str, default="identity",
+                   choices=["identity", "origin", "data_mean"],
+                   help="v5.1 §7.2: choice of constant reference metric Gbar_Q. "
+                        "'identity' = I_{n_q} (default, strongest data-independence "
+                        "claim).  Other modes are ablation hooks (not yet wired).")
+    p.add_argument("--mu-pose", type=float, default=0.0,
+                   help="v5.1 §10: weight of the auxiliary pose-geometric "
+                        "consistency regularizer  L = L_score + mu_pose*L_pose. "
+                        "mu_pose=0 (default) gives the clean exact OU-score-"
+                        "matching baseline.  Recommended range: [0, 1] (ablate).")
+    p.add_argument("--tau-cutoff", type=float, default=0.5,
+                   help="v5.1 §10: indicator cutoff for lambda_p(r) = 1[tau(r) "
+                        "< tau_cutoff] (down-weights Varadhan-invalid large-r "
+                        "contributions to L_pose).  Default 0.5 per spec.")
+    p.add_argument("--loss-metric", type=str, default="I",
+                   choices=["I", "G_inv", "G"],
+                   help="v5.1 §10: weighting metric M for the OU score-matching "
+                        "residual ||s - s*||^2_M.  Default I (Euclidean); "
+                        "'G_inv' / 'G' are ablation choices.")
+    p.add_argument("--alpha-s", type=float, default=None,
+                   help="v5.1 §12.5: start-anchor scalar weight.  When set, "
+                        "applied as alpha_s * start_alpha_{p,R}.  Spec recommends "
+                        "alpha_s >= 2*alpha_g to compensate for the removed IK "
+                        "warm-start.  Default None = use start_alpha_{p,R} as-is.")
+    p.add_argument("--alpha-g", type=float, default=None,
+                   help="v5.1 §12.5: goal-anchor scalar weight (companion to "
+                        "--alpha-s).  Default None = use goal_alpha_{p,R} as-is.")
     p.add_argument("--demo-pool-size", type=int, default=0,
                    help="If > 0, pre-generate this many demos once at startup and "
                         "sample minibatches from the cached pool during training. "
@@ -284,14 +324,25 @@ def main():
 
     # --- SDE + score net ---
     schedule = LinearBetaSchedule(beta_0=args.beta_0, beta_f=args.beta_f, tf=1.0)
-    sde = PoseLangevinSDE(
-        arm, schedule,
-        limiting_q_mean=torch.tensor(args.limiting_mean_q, dtype=dtype),
-        limiting_scale=args.limiting_scale,
-        forward_langevin_drift=args.forward_langevin_drift,
-        confining_kappa=args.confining_kappa,
-        confining_epsilon_frac=args.confining_epsilon_frac,
-    )
+    if args.use_v51:
+        # v5.1: chart-space OU SDE (joint_limit_extension.tex v5.1 §8).
+        # Closed-form forward, exact Euclidean OU score target, IK-free reference.
+        sde = PoseChartOUSDE(arm, schedule, gbar_mode=args.gbar_mode)
+        print(f"[v5.1] PoseChartOUSDE active  (gbar_mode={args.gbar_mode}, "
+              f"mu_pose={args.mu_pose}, tau_cutoff={args.tau_cutoff}, "
+              f"loss_metric={args.loss_metric})")
+        if not args.bounded_chart:
+            print("[v5.1] WARNING: --bounded-chart is recommended with --use-v51 "
+                  "for joint feasibility by construction.")
+    else:
+        sde = PoseLangevinSDE(
+            arm, schedule,
+            limiting_q_mean=torch.tensor(args.limiting_mean_q, dtype=dtype),
+            limiting_scale=args.limiting_scale,
+            forward_langevin_drift=args.forward_langevin_drift,
+            confining_kappa=args.confining_kappa,
+            confining_epsilon_frac=args.confining_epsilon_frac,
+        )
     net = TrajectoryScoreNetUNetPose(
         manifold=arm, H=args.H,
         down_dims=tuple(args.down_dims),
@@ -304,12 +355,18 @@ def main():
     for p in ema_net.parameters():
         p.requires_grad_(False)
 
-    # Method A vs legacy proxy_std mode resolution
-    if args.proxy_std_mode is None:
+    # Method A vs legacy proxy_std mode resolution.
+    # v5.1: always "ou" because proxy_std('ou') = sigma(r) = sqrt(1-exp(-tau)),
+    # which is exactly the closed-form OU marginal std needed for std_trick
+    # (joint_limit_extension v5.1 §10).
+    if args.use_v51:
+        proxy_std_mode = "ou"
+    elif args.proxy_std_mode is None:
         proxy_std_mode = "brownian" if args.method_a else "ou"
     else:
         proxy_std_mode = args.proxy_std_mode
-    print(f"[Method A={'ON' if args.method_a else 'OFF'}]  proxy_std_mode={proxy_std_mode}")
+    print(f"[Method A={'ON' if args.method_a else 'OFF'}|use_v51={args.use_v51}]  "
+          f"proxy_std_mode={proxy_std_mode}")
 
     score_fn = TrajectoryScaledScoreFnPose(net, sde, std_trick=True,
                                             proxy_std_mode=proxy_std_mode)
@@ -357,13 +414,26 @@ def main():
             for g in optim.param_groups:
                 g["lr"] = args.lr * (step + 1) / args.warmup_steps
 
-        loss = traj_dsm_pose_loss(
-            score_fn, sde, x, eps=args.eps,
-            weight=args.weight, n_grw_steps=args.n_grw_steps,
-            goal_cond=goal_cond, cond_drop_prob=args.cond_drop_prob,
-            endpoint_weight=args.endpoint_weight,
-            proxy_std_mode=proxy_std_mode,
-        )
+        if args.use_v51:
+            # v5.1 total loss = L_score + mu_pose * L_pose (spec §10).
+            # Default weight "sigma4" = (sigma^2)^2 matches spec SNR-aware default;
+            # caller may override via --weight (mapped here for back-compat).
+            v51_weight = "sigma4" if args.weight in ("sigma2", "sigma4") else args.weight
+            loss = traj_total_loss_v51_pose(
+                score_fn, sde, x, eps=args.eps,
+                weight=v51_weight, metric=args.loss_metric,
+                goal_cond=goal_cond, cond_drop_prob=args.cond_drop_prob,
+                endpoint_weight=args.endpoint_weight,
+                mu_pose=args.mu_pose, tau_cutoff=args.tau_cutoff,
+            )
+        else:
+            loss = traj_dsm_pose_loss(
+                score_fn, sde, x, eps=args.eps,
+                weight=args.weight, n_grw_steps=args.n_grw_steps,
+                goal_cond=goal_cond, cond_drop_prob=args.cond_drop_prob,
+                endpoint_weight=args.endpoint_weight,
+                proxy_std_mode=proxy_std_mode,
+            )
         optim.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -408,26 +478,54 @@ def main():
         else:  # "last_quarter"
             goal_h = list(range(3 * H1 // 4, H1))
 
-        # Method A: per-trajectory q_init from demo's q_0 (T_start의 IK-equivalent
-        # since T_start = T_φ(q_demo[0]) by construction).  Legacy: uses single μ_q.
-        q_init_eval = (x_demo[:, 0, :arm.n_q].detach().to(device=device, dtype=dtype)
-                        if args.method_a else None)
-        samples = traj_reverse_grw_pose(
-            sde, score_fn_ema, n_samples=args.n_eval_per_z, H=args.H,
-            n_steps=args.n_sample_steps, goal_cond=goal_cond, z_e=z_e,
-            limiting_q_mean=torch.tensor(args.limiting_mean_q),
-            q_init=q_init_eval,
-            limiting_scale=args.limiting_scale,                                  # None → auto √τ_brown(K)
-            eps=args.eps, device=device, dtype=dtype,
-            T_start_Rp=T_start_Rp,
-            start_alpha_p=args.start_alpha_p, start_alpha_R=args.start_alpha_R,
-            start_h_indices=[0],
-            T_target_Rp=T_target_Rp,
-            goal_alpha_p=args.goal_alpha_p, goal_alpha_R=args.goal_alpha_R,
-            goal_h_indices=goal_h,
-            smoothness_alpha_vel=args.smoothness_alpha_vel,
-            smoothness_alpha_acc=args.smoothness_alpha_acc,
-        )
+        # v5.1: IK-free initial sample u ~ N(0, Ḡ_Q^{-1}) — NO q_init from demo,
+        # NO IK warm-start, NO per-trajectory anchor (spec §11.2).
+        # v4.1 (legacy): Method A uses per-trajectory q_init from x_demo[0]
+        # (= IK-equivalent of T_start, the "IK seed cheat" we are removing in v5.1).
+        if args.use_v51:
+            # Optional v5.1 alpha_s / alpha_g scaling (spec §12.5 recommends
+            # alpha_s >= 2 alpha_g to compensate for the absent IK warm-start).
+            start_ap = (args.alpha_s * args.start_alpha_p
+                        if args.alpha_s is not None else args.start_alpha_p)
+            start_aR = (args.alpha_s * args.start_alpha_R
+                        if args.alpha_s is not None else args.start_alpha_R)
+            goal_ap = (args.alpha_g * args.goal_alpha_p
+                       if args.alpha_g is not None else args.goal_alpha_p)
+            goal_aR = (args.alpha_g * args.goal_alpha_R
+                       if args.alpha_g is not None else args.goal_alpha_R)
+            samples = traj_reverse_ou_chart_pose(
+                sde, score_fn_ema, n_samples=args.n_eval_per_z, H=args.H,
+                n_steps=args.n_sample_steps, goal_cond=goal_cond, z_e=z_e,
+                eps=args.eps, device=device, dtype=dtype,
+                T_start_Rp=T_start_Rp,
+                start_alpha_p=start_ap, start_alpha_R=start_aR,
+                start_h_indices=[0],
+                T_target_Rp=T_target_Rp,
+                goal_alpha_p=goal_ap, goal_alpha_R=goal_aR,
+                goal_h_indices=goal_h,
+                smoothness_alpha_vel=args.smoothness_alpha_vel,
+                smoothness_alpha_acc=args.smoothness_alpha_acc,
+            )
+        else:
+            # Method A path: per-trajectory q_init from demo's q_0
+            q_init_eval = (x_demo[:, 0, :arm.n_q].detach().to(device=device, dtype=dtype)
+                            if args.method_a else None)
+            samples = traj_reverse_grw_pose(
+                sde, score_fn_ema, n_samples=args.n_eval_per_z, H=args.H,
+                n_steps=args.n_sample_steps, goal_cond=goal_cond, z_e=z_e,
+                limiting_q_mean=torch.tensor(args.limiting_mean_q),
+                q_init=q_init_eval,
+                limiting_scale=args.limiting_scale,
+                eps=args.eps, device=device, dtype=dtype,
+                T_start_Rp=T_start_Rp,
+                start_alpha_p=args.start_alpha_p, start_alpha_R=args.start_alpha_R,
+                start_h_indices=[0],
+                T_target_Rp=T_target_Rp,
+                goal_alpha_p=args.goal_alpha_p, goal_alpha_R=args.goal_alpha_R,
+                goal_h_indices=goal_h,
+                smoothness_alpha_vel=args.smoothness_alpha_vel,
+                smoothness_alpha_acc=args.smoothness_alpha_acc,
+            )
         # Endpoint pose error
         x_H = samples[:, -1, :]                                                # (B, 15)
         q_H, q_R_H, p_H, _ = arm.split_x(x_H)

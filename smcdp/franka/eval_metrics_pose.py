@@ -296,3 +296,116 @@ def format_row(z_e: float, m: dict) -> str:
 
 def format_header() -> str:
     return f"{'z_e':>5} | {'p(cm)':>6} | {'R(°)':>6} | {'5/5°':>6} | {'5/10°':>6} | {'g_p mm':>7} | {'g_R °':>7} | {'mfe':>5} | {'jvio':>5}"
+
+
+# =====================================================================
+# joint_limit_extension v5.1 required metrics (spec §13)
+# =====================================================================
+
+
+@torch.no_grad()
+def compute_reference_marginal_match(
+    sde,                                         # PoseChartOUSDE
+    tau_0: Tensor,                                # (B, H+1, ambient_dim_pose) — demo trajectories
+    *,
+    r: Optional[float] = None,                    # default tf (forward to r=K)
+) -> dict:
+    """Reference-marginal match diagnostic (v5.1 §13).
+
+    Measures how well the forward marginal p_K matches the IK-free reference
+    p_ref = N(0, Ḡ_Q^{-1}) — required by spec to justify the IK-free reference
+    distribution choice for the chosen β_f.  Reports:
+
+      - KL(emp(u_K) || p_ref)   in Gaussian closed form
+      - W_2^2 approximation     (mean²-distance + trace gap on the diagonal)
+      - empirical mean / variance (chart-coordinate-wise)
+      - alpha(K), sigma²(K)     — finite-K mismatch indicators
+
+    Per spec §8.2.4: the IK-free claim rests on p_∞ = N(0, Ḡ_Q^{-1}) being
+    structurally exact; this metric checks how closely p_K (at the chosen β_f)
+    approaches that stationary.  Smaller is better (β_f = 20 should yield
+    α(K) ≈ 0.007 and KL ≪ 1).
+    """
+    from smcdp.trajectories_pose import traj_forward_ou_chart_pose
+    manifold = sde.manifold
+    schedule = sde.schedule
+    n_q = manifold.n_q
+    B, H1, _ = tau_0.shape
+    device, dtype = tau_0.device, tau_0.dtype
+
+    r_val = schedule.tf if r is None else float(r)
+    r_b = torch.full((B,), r_val, device=device, dtype=dtype)
+    tau_r = traj_forward_ou_chart_pose(sde, tau_0, r_b)
+    u_r = tau_r[..., :n_q]                                                       # (B, H+1, n_q)
+    u_flat = u_r.reshape(B * H1, n_q)                                            # samples for marginal estimate
+
+    emp_mean = u_flat.mean(dim=0)                                                # (n_q,)
+    emp_cov = (
+        (u_flat - emp_mean.unsqueeze(0)).unsqueeze(-1)
+        @ (u_flat - emp_mean.unsqueeze(0)).unsqueeze(-2)
+    ).mean(dim=0)                                                                # (n_q, n_q)
+
+    # Reference distribution Ḡ_Q^{-1} for KL.  For gbar_mode='identity' this is
+    # I_{n_q}, so Ḡ_Q = I and log det Ḡ_Q = 0.  For other modes the SDE
+    # container exposes gbar_apply / gbar_inv_apply etc. — extend here when
+    # those modes are wired.
+    if sde.gbar_mode == "identity":
+        # KL(N(μ, Σ) || N(0, I))  =  ½ ( tr(Σ) + ‖μ‖² − n − log det Σ )
+        sign, logdet_Sigma = torch.linalg.slogdet(emp_cov + 1e-8 * torch.eye(n_q, device=device, dtype=dtype))
+        kl = 0.5 * (
+            torch.diagonal(emp_cov).sum() + emp_mean.pow(2).sum() - n_q
+            - sign * logdet_Sigma
+        )
+        # W_2^2 lower bound for diagonal-only approximation:
+        #   ‖μ‖² + tr(Σ + I − 2 √Σ)  ≈  ‖μ‖² + Σ_i (√σ_ii − 1)²
+        diag_var = torch.diagonal(emp_cov).clamp(min=0.0)
+        w2_sq = emp_mean.pow(2).sum() + (diag_var.sqrt() - 1.0).pow(2).sum()
+    else:
+        # Hook for non-identity Ḡ_Q (v5.1 ablation modes "origin", "data_mean").
+        raise NotImplementedError(
+            f"reference-marginal KL not wired for gbar_mode='{sde.gbar_mode}'"
+        )
+
+    alpha_K = schedule.alpha(torch.tensor(r_val, device=device, dtype=dtype)).item()
+    sigma2_K = schedule.sigma2(torch.tensor(r_val, device=device, dtype=dtype)).item()
+
+    return {
+        "r": r_val,
+        "alpha_r": alpha_K,
+        "sigma2_r": sigma2_K,
+        "kl_emp_vs_pref": float(kl.item()),
+        "w2sq_emp_vs_pref": float(w2_sq.item()),
+        "emp_mean_norm": float(emp_mean.norm().item()),
+        "emp_var_mean": float(torch.diagonal(emp_cov).mean().item()),
+        "emp_var_min": float(torch.diagonal(emp_cov).min().item()),
+        "emp_var_max": float(torch.diagonal(emp_cov).max().item()),
+    }
+
+
+@torch.no_grad()
+def compute_chart_saturation(
+    samples: Tensor,                              # (B, H+1, ambient_dim_pose) — generated trajectories
+    n_q: int,
+) -> dict:
+    """Chart-saturation diagnostic on ‖u‖_∞ percentiles (v5.1 §13).
+
+    Spec recommendation: healthy operating regime ‖u‖_∞ ≤ 2; saturation
+    onset > 3 (sech² < 0.01 → near-degenerate D_ψ).  Reported alongside
+    p50 / p90 / p99 over the sampled trajectories.
+    """
+    u = samples[..., :n_q]
+    u_inf = u.abs().reshape(-1, n_q).max(-1).values                              # (B*H1,)
+    sorted_u = u_inf.sort().values
+    n = sorted_u.numel()
+
+    def pct(p: float) -> float:
+        idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+        return float(sorted_u[idx].item())
+
+    return {
+        "u_inf_p50": pct(0.50),
+        "u_inf_p90": pct(0.90),
+        "u_inf_p99": pct(0.99),
+        "u_inf_max": float(sorted_u[-1].item()),
+        "saturation_rate": float((u_inf > 3.0).float().mean().item()),
+    }

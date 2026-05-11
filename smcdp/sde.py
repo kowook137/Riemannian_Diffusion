@@ -65,6 +65,39 @@ class LinearBetaSchedule:
             raise ValueError(f"unknown proxy_std mode {mode!r}")
         return torch.sqrt(1.0 - torch.exp(-I))
 
+    # ===================================================================
+    # joint_limit_extension v5.1 — closed-form VP-OU transition helpers
+    # (joint_limit_extension.tex §8.1, §8.2)
+    # ===================================================================
+    # Forward OU on chart u:
+    #     du_r = -½ β(r) u_r dr + √β(r) Ḡ_Q^{-1/2} dW_r
+    # Closed-form transition (constant diffusion → Gaussian):
+    #     p_{r|0}(u_r | u_0) = N( α(r) · u_0 , σ²(r) · Ḡ_Q^{-1} )
+    #     α(r) := exp(-τ(r)/2)             (decay of mean)
+    #     σ²(r) := 1 - exp(-τ(r))          (variance growth)
+    #     τ(r)  := ∫_0^r β(s) ds = self.integral(r)
+    # Exact Euclidean score:
+    #     ∇_{u_r} log p_{r|0}(u_r|u_0) = -Ḡ_Q · (u_r - α(r) u_0) / σ²(r)
+    # σ(r) = √σ²(r) is identical to `proxy_std(r, "ou")` — kept as a named alias.
+
+    def tau(self, t: Tensor) -> Tensor:
+        """Cumulative β-integral τ(r) := ∫_0^r β(s) ds (alias for `integral`)."""
+        return self.integral(t)
+
+    def alpha(self, t: Tensor) -> Tensor:
+        """OU mean-decay factor α(r) = exp(-τ(r)/2)  ∈ (0, 1].  α(0) = 1."""
+        return torch.exp(-0.5 * self.integral(t))
+
+    def sigma2(self, t: Tensor) -> Tensor:
+        """OU marginal variance scalar σ²(r) = 1 − exp(−τ(r))  ∈ [0, 1).
+        Full marginal covariance of u_r | u_0 is σ²(r) · Ḡ_Q^{-1}.
+        σ²(0) = 0 (no noise); σ²(K) → 1 as τ(K) → ∞ (stationary limit)."""
+        return 1.0 - torch.exp(-self.integral(t))
+
+    def sigma(self, t: Tensor) -> Tensor:
+        """σ(r) = √σ²(r) = √(1 − exp(−τ(r))).  Identical to proxy_std(t,'ou')."""
+        return torch.sqrt((1.0 - torch.exp(-self.integral(t))).clamp(min=1e-12))
+
 
 class LangevinSDE:
     """Langevin dynamics on M  —  general parent class (RSGM `Langevin`).

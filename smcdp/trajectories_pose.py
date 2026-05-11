@@ -960,3 +960,510 @@ class TrajectoryScaledScoreFnPose(nn.Module):
             sigma = self.sde.schedule.proxy_std(t, mode=self.proxy_std_mode).clamp(min=1e-6).view(B, 1, 1)
             out = out / sigma
         return out
+
+
+# =====================================================================
+# joint_limit_extension v5.1 — chart-space OU SDE (closed-form transition)
+# =====================================================================
+#
+# Implements joint_limit_extension.tex v5.1:
+#     Forward SDE (chart u):  du_r = -½ β(r) u_r dr + √β(r) Ḡ_Q^{-1/2} dW_r
+#     Closed-form transition: p_{r|0}(u_r | u_0) = N(α(r) u_0, σ²(r) Ḡ_Q^{-1})
+#         α(r) = exp(-τ(r)/2),  σ²(r) = 1 - exp(-τ(r)),  τ(r) = ∫_0^r β ds
+#     Exact Euclidean score:  ∇_{u_r} log p_{r|0} = -Ḡ_Q (u_r - α u_0) / σ²(r)
+#     Stationary p_∞ = N(0, Ḡ_Q^{-1})   ← IK-free reference (spec §11.2)
+#     Reverse SDE (Convention 1, Δr < 0):
+#         du_r = [-½ β u_r - β Ḡ_Q^{-1} s_θ^u] dr + √β Ḡ_Q^{-1/2} d\bar W_r
+#
+# This module is the replacement for the v4.1 Method-A drift-free Brownian
+# pipeline above.  Score-network architecture (TrajectoryScoreNetUNetPose)
+# and chart-aware overrides (BoundedChartPoseManifold) are unchanged — the
+# only network-input change required by v5.1 is the absence of any
+# q_init / IK-derived anchor, which is already the case for the existing
+# net (input is [u, r, h/H, z_e, T_start, T_target] — see spec §9).
+
+
+class PoseChartOUSDE:
+    """v5.1 chart-space OU SDE container (joint_limit_extension.tex §8).
+
+    Forward SDE on chart u ∈ R^{n_q}:
+        du_r = -½ β(r) u_r dr + √β(r) Ḡ_Q^{-1/2} dW_r,   u_0 ~ p_data
+    Closed-form transition:
+        p_{r|0}(u_r | u_0) = N(α(r) u_0, σ²(r) Ḡ_Q^{-1})
+        α(r) = exp(-τ(r)/2),  σ²(r) = 1 - exp(-τ(r)),  τ(r) = ∫_0^r β(s) ds
+    Stationary (IK-free reference, spec §11.2):
+        p_∞ = N(0, Ḡ_Q^{-1})
+
+    The reference metric Ḡ_Q is a *constant* SPD matrix — independent of u, z_e,
+    c, and sample.  Three options per spec §7.2:
+        - "identity":  Ḡ_Q = I_{n_q}                                   (default)
+        - "origin":    Ḡ_Q = G_Q(u=0, z_e_bar)  (fixed embodiment z_e_bar)
+        - "data_mean": Ḡ_Q = E_{(u_0, z_e) ~ p_data}[G_Q(u_0, z_e)]
+    Only "identity" is wired here; the other modes raise NotImplementedError
+    (hooks reserved for v5.1 ablations).
+    """
+
+    def __init__(
+        self,
+        manifold: EmbodimentPoseGraphManifold,
+        schedule,
+        *,
+        gbar_mode: str = "identity",
+    ):
+        self.manifold = manifold
+        self.schedule = schedule
+        if gbar_mode not in ("identity", "origin", "data_mean"):
+            raise ValueError(f"unknown gbar_mode '{gbar_mode}'")
+        if gbar_mode != "identity":
+            raise NotImplementedError(
+                f"gbar_mode='{gbar_mode}' not yet wired (v5.1 ablation hook); "
+                f"use 'identity' for the spec default."
+            )
+        self.gbar_mode = str(gbar_mode)
+
+    @property
+    def t0(self) -> float:
+        return self.schedule.t0
+
+    @property
+    def tf(self) -> float:
+        return self.schedule.tf
+
+    @property
+    def n_q(self) -> int:
+        return self.manifold.n_q
+
+    # ------------------ Ḡ_Q applies (vectorized over leading dims) ------------------
+
+    def gbar_apply(self, x: Tensor) -> Tensor:
+        """Compute (Ḡ_Q · x)  along the last axis.  Identity for default mode
+        (Ḡ_Q = I_{n_q})  →  no-op."""
+        if self.gbar_mode == "identity":
+            return x
+        raise NotImplementedError
+
+    def gbar_inv_apply(self, x: Tensor) -> Tensor:
+        """Compute (Ḡ_Q^{-1} · x)  along the last axis.  Identity default."""
+        if self.gbar_mode == "identity":
+            return x
+        raise NotImplementedError
+
+    def gbar_inv_sqrt_apply(self, x: Tensor) -> Tensor:
+        """Compute (Ḡ_Q^{-1/2} · x)  along the last axis.  Identity default."""
+        if self.gbar_mode == "identity":
+            return x
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------
+# Forward sampler — closed-form OU transition (spec §8.1, §11)
+# ---------------------------------------------------------------------
+
+
+def traj_forward_ou_chart_pose(
+    sde: PoseChartOUSDE,
+    tau_0: Tensor,                                                              # (B, H+1, ambient_dim_pose)
+    r: Tensor,                                                                  # (B,) diffusion times
+) -> Tensor:
+    """Closed-form OU forward sample on chart u (spec §8.1).
+
+    For each batch element b and timestep h, draws
+        u_{h, r_b}  =  α(r_b) · u_{h, 0}  +  σ(r_b) · Ḡ_Q^{-1/2} · ε_{b, h},
+        ε_{b, h}  ~  N(0, I_{n_q})
+    so that  u_{h, r_b} | u_{h, 0}  ~  N(α u_0, σ² Ḡ_Q^{-1})  exactly  (spec §8.1.2).
+
+    Returns the lifted trajectory in ambient form via graph retraction
+    `manifold.make_x(u_r, z) = (u_r, T̃_φ(u_r, z), z)`, i.e. (B, H+1, ambient_dim).
+
+    No iterative discretization, no Varadhan approximation, no drift term —
+    the constant-coefficient OU admits an exact Gaussian transition.
+    """
+    manifold = sde.manifold
+    schedule = sde.schedule
+    n_q = manifold.n_q
+    B, H1, _ = tau_0.shape
+
+    u_0 = tau_0[..., :n_q]                                                       # (B, H+1, n_q)
+    z_traj = tau_0[..., n_q + 7:]                                                # (B, H+1, n_z) frozen
+
+    alpha_r = schedule.alpha(r).view(B, 1, 1)                                    # (B, 1, 1)
+    sigma_r = schedule.sigma(r).view(B, 1, 1)                                    # (B, 1, 1)
+    eps = torch.randn_like(u_0)                                                  # (B, H+1, n_q)
+    noise = sde.gbar_inv_sqrt_apply(eps)                                         # Ḡ_Q^{-1/2} ε
+    u_r = alpha_r * u_0 + sigma_r * noise                                        # (B, H+1, n_q)
+
+    z_flat = z_traj.reshape(B * H1, -1)
+    u_r_flat = u_r.reshape(B * H1, n_q)
+    x_flat = manifold.make_x(u_r_flat, z_flat)
+    return x_flat.reshape(B, H1, manifold.ambient_dim)
+
+
+# ---------------------------------------------------------------------
+# Score-matching loss — exact OU target, optional pose-consistency reg
+# (spec §10)
+# ---------------------------------------------------------------------
+
+
+def traj_ou_score_loss_pose(
+    score_fn,                                                                   # (τ, t, goal_cond=None) → (B, H+1, n_q)  Euclidean chart score
+    sde: PoseChartOUSDE,
+    tau_0: Tensor,
+    *,
+    eps: float = 1e-3,
+    weight: str = "sigma4",                                                     # spec §10 default w(r) = σ²(r)²
+    metric: str = "I",                                                          # spec §10: M ∈ {I, G^{-1}, G}
+    goal_cond: Optional[Tensor] = None,
+    cond_drop_prob: float = 0.0,
+    endpoint_weight: float = 1.0,
+    _shared: Optional[dict] = None,                                             # internal: share r, tau_r with pose-reg
+) -> Tensor:
+    """Exact OU score-matching loss (joint_limit_extension v5.1 §10):
+
+        L_score = E_{r, u_0, u_r} [ w(r) · Σ_h ‖s_θ^u_h - s*_h‖²_M ]
+        s*(u_r, u_0; r)  =  - Ḡ_Q · (u_r - α(r) u_0) / σ²(r)         (spec §10 boxed)
+
+    Default M = I_{n_q}, w(r) = σ²(r)² (SNR-aware, spec §10).
+    The chart target s* is the *exact* Euclidean OU score; no Varadhan
+    approximation (spec §10 "exact, not Varadhan-approximated").
+    """
+    manifold = sde.manifold
+    schedule = sde.schedule
+    n_q = manifold.n_q
+    B, H1, _ = tau_0.shape
+    device, dtype = tau_0.device, tau_0.dtype
+
+    # 1. Sample diffusion time r ∈ [eps, tf]  — or reuse from _shared
+    if _shared is not None and "r" in _shared:
+        r = _shared["r"]
+        tau_r = _shared["tau_r"]
+    else:
+        r = eps + (schedule.tf - eps) * torch.rand(B, device=device, dtype=dtype)
+        tau_r = traj_forward_ou_chart_pose(sde, tau_0, r)
+        if _shared is not None:
+            _shared["r"] = r
+            _shared["tau_r"] = tau_r
+
+    # 2. CFG cond dropout
+    if goal_cond is not None and cond_drop_prob > 0.0:
+        drop_mask = torch.rand(B, device=device) < cond_drop_prob
+        if drop_mask.any():
+            goal_cond = goal_cond.clone()
+            goal_cond[drop_mask] = 0.0
+
+    # 3. Exact OU score target  s* = -Ḡ_Q (u_r - α u_0) / σ²(r)
+    u_0 = tau_0[..., :n_q]
+    u_r = tau_r[..., :n_q]
+    alpha_r = schedule.alpha(r).view(B, 1, 1)
+    sigma2_r = schedule.sigma2(r).clamp(min=1e-12).view(B, 1, 1)
+    residual = u_r - alpha_r * u_0                                              # (B, H+1, n_q)
+    target = -sde.gbar_apply(residual) / sigma2_r                               # (B, H+1, n_q)
+    if _shared is not None:
+        _shared["target"] = target
+
+    # 4. Network Euclidean chart score
+    if goal_cond is not None:
+        s_chart = score_fn(tau_r, r, goal_cond=goal_cond)
+    else:
+        s_chart = score_fn(tau_r, r)
+    if _shared is not None:
+        _shared["s_chart"] = s_chart
+
+    diff = s_chart - target                                                     # (B, H+1, n_q)
+
+    # 5. Weighting metric M
+    z = tau_r[..., n_q + 7:]
+    if metric == "I":
+        sq_per_pt_h = (diff * diff).sum(-1)                                     # (B, H+1)
+    elif metric == "G_inv":
+        u_r_flat = u_r.reshape(B * H1, n_q)
+        z_flat = z.reshape(B * H1, -1)
+        L = manifold.G_pose_chol(u_r_flat, z_flat)                              # (B*H1, n_q, n_q)
+        diff_flat = diff.reshape(B * H1, n_q, 1)
+        a = torch.linalg.solve_triangular(L, diff_flat, upper=False).squeeze(-1)
+        sq_per_pt_h = a.pow(2).sum(-1).reshape(B, H1)
+    elif metric == "G":
+        u_r_flat = u_r.reshape(B * H1, n_q)
+        z_flat = z.reshape(B * H1, -1)
+        G = manifold.G_pose(u_r_flat, z_flat)                                   # (B*H1, n_q, n_q)
+        diff_flat = diff.reshape(B * H1, n_q)
+        sq_per_pt_h = (diff_flat.unsqueeze(-2) @ G @ diff_flat.unsqueeze(-1)
+                       ).squeeze(-1).squeeze(-1).reshape(B, H1)
+    else:
+        raise ValueError(f"metric must be 'I' | 'G_inv' | 'G', got {metric!r}")
+
+    if endpoint_weight != 1.0:
+        h_weights = torch.ones(H1, device=device, dtype=dtype)
+        h_weights[-1] = float(endpoint_weight)
+        sq_per_traj = (sq_per_pt_h * h_weights).sum(-1)                         # (B,)
+    else:
+        sq_per_traj = sq_per_pt_h.sum(-1)
+
+    # 6. SNR-aware weighting w(r)
+    if weight == "sigma4":
+        w = schedule.sigma2(r).pow(2)                                           # spec §10 default
+    elif weight == "sigma2":
+        w = schedule.sigma2(r)
+    elif weight == "beta":
+        w = schedule.beta(r)
+    elif weight == "none":
+        w = torch.ones_like(r)
+    else:
+        raise ValueError(f"unknown weight '{weight}'")
+
+    return (w * sq_per_traj).mean()
+
+
+def traj_pose_consistency_loss(
+    score_fn,
+    sde: PoseChartOUSDE,
+    tau_0: Tensor,
+    *,
+    eps: float = 1e-3,
+    tau_cutoff: float = 0.5,                                                    # spec §10 default
+    goal_cond: Optional[Tensor] = None,
+    _shared: Optional[dict] = None,                                             # internal: share r, tau_r, s_chart
+) -> Tensor:
+    """Auxiliary pose-geometric consistency regularizer (v5.1 §10).
+
+        L_pose = E_{r, u_0, u_r} [ λ_p(r) · Σ_h ‖J^Q(u_{h,r}, z_e) · s_θ^u_h
+                                              - (1/τ(r)) Log_SE3(T̃_φ(u_{h,r})^{-1} T̃_φ(u_{h,0}))‖²_W ]
+        λ_p(r) = 1[τ(r) < τ_cutoff],   τ_cutoff ≈ 0.5      (down-weights large-r where Varadhan breaks)
+
+    The pose component is NOT an exact transition score (since T̃_φ is a
+    deterministic function of u, so the u-OU does NOT induce a closed-form
+    Gaussian on T).  This term is retained as a Varadhan-style consistency
+    prior, valid in the small-r regime — see spec §10 "Validity regime".
+
+    Added to L_score with factor μ_pose (default 0).
+    """
+    manifold = sde.manifold
+    schedule = sde.schedule
+    n_q = manifold.n_q
+    B, H1, _ = tau_0.shape
+    device, dtype = tau_0.device, tau_0.dtype
+
+    # Reuse r / tau_r / s_chart from L_score path when available.
+    if _shared is not None and "tau_r" in _shared:
+        r = _shared["r"]
+        tau_r_x = _shared["tau_r"]
+        s_chart = _shared.get("s_chart")
+    else:
+        r = eps + (schedule.tf - eps) * torch.rand(B, device=device, dtype=dtype)
+        tau_r_x = traj_forward_ou_chart_pose(sde, tau_0, r)
+        s_chart = None
+
+    if s_chart is None:
+        if goal_cond is not None:
+            s_chart = score_fn(tau_r_x, r, goal_cond=goal_cond)
+        else:
+            s_chart = score_fn(tau_r_x, r)
+
+    u_r = tau_r_x[..., :n_q]
+    u_0 = tau_0[..., :n_q]
+    z = tau_r_x[..., n_q + 7:]
+
+    u_r_flat = u_r.reshape(B * H1, n_q)
+    u_0_flat = u_0.reshape(B * H1, n_q)
+    z_flat = z.reshape(B * H1, -1)
+    s_flat = s_chart.reshape(B * H1, n_q)
+
+    # J^Q at u_r  ∈ R^{(B*H1) × 6 × n_q} ;  body-frame on bounded chart.
+    Jq_flat = manifold.jacobian_pose(u_r_flat, z_flat)
+    Js_flat = (Jq_flat @ s_flat.unsqueeze(-1)).squeeze(-1)                       # (B*H1, 6)
+
+    # Pose-tangent displacement from r to 0:  Log_SE(3)( T̃_φ(u_r)^{-1} T̃_φ(u_0) )
+    R_r, p_r = manifold.T_phi_Rp(u_r_flat, z_flat)
+    R_0, p_0 = manifold.T_phi_Rp(u_0_flat, z_flat)
+    xi = log_relative_Rp(R_r, p_r, R_0, p_0)                                    # (B*H1, 6)
+
+    tau_brown = schedule.tau(r).clamp(min=1e-12)                                # (B,)
+    tau_per_h = tau_brown.view(B, 1).expand(B, H1).reshape(B * H1, 1)            # (B*H1, 1)
+    target_pose = xi / tau_per_h                                                # (B*H1, 6)
+
+    W = manifold._W_diag(u_r_flat)                                              # (6,)
+    diff = Js_flat - target_pose                                                # (B*H1, 6)
+    sq_per_pt = (diff * diff * W.unsqueeze(0)).sum(-1).reshape(B, H1)           # (B, H+1)
+    sq_per_traj = sq_per_pt.sum(-1)                                             # (B,)
+
+    # Indicator down-weight  λ_p(r) = 1[τ(r) < τ_cutoff]
+    lam_p = (tau_brown < tau_cutoff).to(dtype=dtype)                            # (B,)
+    return (lam_p * sq_per_traj).mean()
+
+
+def traj_total_loss_v51_pose(
+    score_fn,
+    sde: PoseChartOUSDE,
+    tau_0: Tensor,
+    *,
+    eps: float = 1e-3,
+    weight: str = "sigma4",
+    metric: str = "I",
+    goal_cond: Optional[Tensor] = None,
+    cond_drop_prob: float = 0.0,
+    endpoint_weight: float = 1.0,
+    mu_pose: float = 0.0,
+    tau_cutoff: float = 0.5,
+) -> Tensor:
+    """v5.1 total loss: L = L_score + μ_pose · L_pose   (spec §10).
+
+    When μ_pose == 0 (default), L_pose is not computed (clean exact OU score
+    matching baseline).  When μ_pose > 0, the r-sample, u_r noise, and
+    network score are shared between the two terms for efficiency — both
+    losses observe the SAME forward sample so their gradients are coherent.
+    """
+    if mu_pose == 0.0:
+        return traj_ou_score_loss_pose(
+            score_fn, sde, tau_0, eps=eps, weight=weight, metric=metric,
+            goal_cond=goal_cond, cond_drop_prob=cond_drop_prob,
+            endpoint_weight=endpoint_weight,
+        )
+
+    shared: dict = {}
+    L_score = traj_ou_score_loss_pose(
+        score_fn, sde, tau_0, eps=eps, weight=weight, metric=metric,
+        goal_cond=goal_cond, cond_drop_prob=cond_drop_prob,
+        endpoint_weight=endpoint_weight, _shared=shared,
+    )
+    L_pose = traj_pose_consistency_loss(
+        score_fn, sde, tau_0, eps=eps, tau_cutoff=tau_cutoff,
+        goal_cond=goal_cond, _shared=shared,
+    )
+    return L_score + mu_pose * L_pose
+
+
+# ---------------------------------------------------------------------
+# Reverse sampler — Convention-1 reverse OU + graph retraction (spec §11)
+# ---------------------------------------------------------------------
+
+
+@torch.no_grad()
+def traj_reverse_ou_chart_pose(
+    sde: PoseChartOUSDE,
+    score_fn,                                                                   # (τ, t, goal_cond=None) → (B, H+1, n_q)
+    n_samples: int,
+    H: int,
+    n_steps: int = 200,
+    goal_cond: Optional[Tensor] = None,
+    z_e: Optional[Tensor] = None,                                               # (B, n_z)
+    eps: float = 2e-4,
+    device=None, dtype=torch.float32,
+    score_postprocess=None,
+    # ---- reward guidance (spec §11.4 + §12) ----
+    T_start_Rp: Optional[tuple[Tensor, Tensor]] = None,
+    start_alpha_p: float = 0.0,
+    start_alpha_R: float = 0.0,
+    start_h_indices: Optional[list[int]] = None,
+    T_target_Rp: Optional[tuple[Tensor, Tensor]] = None,
+    goal_alpha_p: float = 0.0,
+    goal_alpha_R: float = 0.0,
+    goal_h_indices: Optional[list[int]] = None,
+    smoothness_alpha_vel: float = 0.0,
+    smoothness_alpha_acc: float = 0.0,
+    smoothness_chart_form: str = "q",
+) -> Tensor:
+    """Reverse-time chart-space OU sampler with graph retraction (v5.1 §11).
+
+    Reference distribution (IK-FREE — spec §11.2):
+        u_h^{(K)}  ~  N(0, Ḡ_Q^{-1})         (data-independent, conditioning-independent)
+        x_h^{(K)}  =  H̃_φ^{b-pose}(u_h^{(K)}, z_e) = (u_h, T̃_φ(u_h, z_e), z_e)
+
+    Reverse SDE (Convention 1: forward time r, Δr < 0 — spec §11.3):
+        du_r = [-½ β(r) u_r - β(r) Ḡ_Q^{-1} s_θ^u(u_r, r, c, z_e)] dr
+               + √β(r) Ḡ_Q^{-1/2} d\bar W_r
+
+    Discrete Euler-Maruyama with forward-positive dr := |Δr|  > 0:
+        u_{k+1}  =  u_k  +  [½ β(r_k) u_k + β(r_k) Ḡ_Q^{-1} (s_θ + m_k G_Q^{-1} ∇R)] · dr
+                       +  √(β(r_k) · dr) · Ḡ_Q^{-1/2} · ξ_k
+
+    (Sign verification, spec §11.3.4: drift in `-½ β u · Δr` with Δr < 0 gives
+    `+½ β u · dr` — the reverse OU mirror pushing u away from origin, mirroring
+    the forward attraction; score term `-β Ḡ^{-1} s · Δr` gives `+β Ḡ^{-1} s · dr`,
+    pointing toward higher-density regions.  Signs are consistent.)
+
+    No IK seed, no q_warm, no per-trajectory anchor — multimodality is captured
+    by the score network alone, conditional on (T_start, T_target, z_e).
+    """
+    manifold = sde.manifold
+    schedule = sde.schedule
+    n_q = manifold.n_q
+    n_z = manifold.n_z
+    H1 = H + 1
+    B = n_samples
+
+    if z_e is None:
+        z_e = torch.zeros(B, n_z, device=device, dtype=dtype)
+    z_e = z_e.to(device=device, dtype=dtype)
+    if z_e.shape[0] != B:
+        raise ValueError(f"z_e batch ({z_e.shape[0]}) ≠ B ({B})")
+    z_traj = z_e.unsqueeze(1).expand(B, H1, n_z).contiguous()
+    z_flat = z_traj.reshape(B * H1, n_z)
+
+    # ---- IK-FREE initial sample  u ~ N(0, Ḡ_Q^{-1})  (spec §11.2) ----
+    eps_init = torch.randn(B, H1, n_q, device=device, dtype=dtype)
+    u = sde.gbar_inv_sqrt_apply(eps_init)                                       # (B, H+1, n_q)
+    x = manifold.make_x(
+        u.reshape(B * H1, n_q), z_flat,
+    ).reshape(B, H1, manifold.ambient_dim)
+
+    # Reverse-time grid: r descends from tf to eps
+    r_grid = torch.linspace(schedule.tf, eps, n_steps + 1, device=device, dtype=dtype)
+
+    for k in range(n_steps):
+        r_k = r_grid[k]
+        r_kp1 = r_grid[k + 1]
+        dr = (r_k - r_kp1).abs()                                                # > 0 (forward-positive |Δr|)
+        beta_k = schedule.beta(r_k.expand(B)).view(B, 1, 1)                     # (B, 1, 1)
+
+        # ---- Network Euclidean chart score ----
+        if goal_cond is not None:
+            s = score_fn(x, r_k.expand(B), goal_cond=goal_cond)
+        else:
+            s = score_fn(x, r_k.expand(B))
+        if score_postprocess is not None:
+            s = score_postprocess(s, r_k)
+
+        # ---- Reward guidance correction (spec §11.4, §12) ----
+        # The helpers already produce  -G_Q^{-1} ∂_u R  (the natural-gradient-
+        # preconditioned ascent direction on  -R) — they are added directly to
+        # the score in the same convention as the v4.1 path.  Outer Ḡ_Q^{-1}
+        # is applied below.
+        if T_start_Rp is not None and (start_alpha_p > 0.0 or start_alpha_R > 0.0):
+            s_h = start_h_indices if start_h_indices is not None else [0]
+            s = s + _pose_anchor_guidance_chart(
+                x, T_start_Rp, manifold,
+                alpha_p=start_alpha_p, alpha_R=start_alpha_R,
+                h_indices=s_h,
+            )
+        if T_target_Rp is not None and (goal_alpha_p > 0.0 or goal_alpha_R > 0.0):
+            g_h = goal_h_indices if goal_h_indices is not None else [H1 - 1]
+            s = s + _pose_anchor_guidance_chart(
+                x, T_target_Rp, manifold,
+                alpha_p=goal_alpha_p, alpha_R=goal_alpha_R,
+                h_indices=g_h,
+            )
+        if smoothness_alpha_vel > 0.0 or smoothness_alpha_acc > 0.0:
+            s = s + _smoothness_guidance_chart(
+                x, manifold,
+                alpha_vel=smoothness_alpha_vel,
+                alpha_acc=smoothness_alpha_acc,
+                chart_form=smoothness_chart_form,
+            )
+
+        # ---- Ḡ_Q^{-1} (score + guidance) ----
+        gbar_inv_s = sde.gbar_inv_apply(s)                                      # (B, H+1, n_q)
+
+        # ---- Forward-positive-dr drift:  ½ β u + β · Ḡ_Q^{-1} · s_total ----
+        drift = 0.5 * beta_k * u + beta_k * gbar_inv_s                          # (B, H+1, n_q)
+
+        # ---- Noise:  √(β · dr) · Ḡ_Q^{-1/2} · ξ ----
+        xi = torch.randn(B, H1, n_q, device=device, dtype=dtype)
+        noise = (beta_k * dr).sqrt() * sde.gbar_inv_sqrt_apply(xi)              # (B, H+1, n_q)
+
+        u = u + drift * dr + noise
+
+        # ---- Graph retract:  x = (u, T̃_φ(ψ(u), z), z) ----
+        x = manifold.make_x(
+            u.reshape(B * H1, n_q), z_flat,
+        ).reshape(B, H1, manifold.ambient_dim)
+
+    return x

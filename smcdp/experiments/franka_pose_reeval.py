@@ -20,6 +20,7 @@ from smcdp.franka.demo_gen_pose import FrankaBimodalReachingDemoPose
 from smcdp.trajectories_pose import (
     TrajectoryScoreNetUNetPose, TrajectoryScaledScoreFnPose,
     PoseLangevinSDE, traj_reverse_grw_pose,
+    PoseChartOUSDE, traj_reverse_ou_chart_pose,
 )
 from smcdp.franka.eval_metrics_pose import (
     compute_pose_metrics, format_header, format_row,
@@ -75,15 +76,21 @@ def main():
         print(f"[v4.1] bounded chart wrapper reconstructed "
               f"(TanhBoundedChart, lambda_floor={a.get('lambda_floor', 1e-4):.1e})")
 
-    # Score net
+    # Score net + SDE — v5.1 (chart-space OU) vs v4.1 (Langevin Brownian) dispatch.
     schedule = LinearBetaSchedule(beta_0=a["beta_0"], beta_f=a["beta_f"], tf=1.0)
-    sde = PoseLangevinSDE(arm, schedule,
-                           limiting_q_mean=torch.tensor(a["limiting_mean_q"], dtype=dtype),
-                           limiting_scale=a.get("limiting_scale", None),
-                           forward_langevin_drift=a["forward_langevin_drift"],
-                           confining_kappa=a.get("confining_kappa", 0.0),
-                           confining_epsilon_frac=a.get("confining_epsilon_frac", 0.05))
-    proxy_std_mode = a.get("proxy_std_mode") or ("brownian" if a.get("method_a") else "ou")
+    use_v51 = bool(a.get("use_v51", False))
+    if use_v51:
+        sde = PoseChartOUSDE(arm, schedule, gbar_mode=a.get("gbar_mode", "identity"))
+        proxy_std_mode = "ou"
+        print(f"[v5.1] PoseChartOUSDE reconstructed (gbar_mode={a.get('gbar_mode','identity')})")
+    else:
+        sde = PoseLangevinSDE(arm, schedule,
+                               limiting_q_mean=torch.tensor(a["limiting_mean_q"], dtype=dtype),
+                               limiting_scale=a.get("limiting_scale", None),
+                               forward_langevin_drift=a["forward_langevin_drift"],
+                               confining_kappa=a.get("confining_kappa", 0.0),
+                               confining_epsilon_frac=a.get("confining_epsilon_frac", 0.05))
+        proxy_std_mode = a.get("proxy_std_mode") or ("brownian" if a.get("method_a") else "ou")
     net = TrajectoryScoreNetUNetPose(manifold=arm, H=a["H"],
         down_dims=tuple(a["down_dims"]),
         diffusion_step_embed_dim=a["diff_step_embed"],
@@ -99,9 +106,13 @@ def main():
     out_dir = Path(args.ckpt).parent
     metrics = {"per_z": [], "args": vars(args), "source_ckpt": str(args.ckpt),
                 "method_a": a.get("method_a", False),
+                "use_v51": use_v51,
                 "config": {k: a.get(k) for k in ["sigma_p", "tikhonov_frac",
                                                    "confining_kappa", "forward_langevin_drift",
-                                                   "limiting_scale", "proxy_std_mode"]}}
+                                                   "limiting_scale", "proxy_std_mode",
+                                                   "bounded_chart", "use_v51", "gbar_mode",
+                                                   "mu_pose", "tau_cutoff", "loss_metric",
+                                                   "alpha_s", "alpha_g", "beta_f"]}}
     print("\n" + format_header())
     H1 = a["H"] + 1
     for z_val in args.z_list:
@@ -123,9 +134,6 @@ def main():
         x_demo, _, _, T_target, T_start = demo.sample(args.n_eval_per_z, device=device, dtype=dtype)
         goal_cond = torch.cat([T_start, T_target], dim=-1)
         z_e = torch.full((args.n_eval_per_z, 1), z_val, device=device, dtype=dtype)
-        # Method A: per-traj q_init from x_demo[0]; legacy: None
-        q_init_eval = (x_demo[:, 0, :arm.n_q].detach().to(device=device, dtype=dtype)
-                       if a.get("method_a") else None)
         # decode anchor poses for guidance (if used at training)
         T_start_Rp = pose7_to_Rp(T_start) if (a.get("start_alpha_p", 0) > 0 or a.get("start_alpha_R", 0) > 0) else None
         T_target_Rp = pose7_to_Rp(T_target) if (a.get("goal_alpha_p", 0) > 0 or a.get("goal_alpha_R", 0) > 0) else None
@@ -135,21 +143,51 @@ def main():
         elif a.get("goal_h_mask") == "last_quarter": goal_h = list(range(3 * H1 // 4, H1))
         else: goal_h = [H_idx]
 
-        samples = traj_reverse_grw_pose(
-            sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
-            n_steps=a["n_sample_steps"], goal_cond=goal_cond, z_e=z_e,
-            limiting_q_mean=torch.tensor(a["limiting_mean_q"]),
-            q_init=q_init_eval, limiting_scale=a.get("limiting_scale"),
-            eps=a["eps"], device=device, dtype=dtype,
-            T_start_Rp=T_start_Rp,
-            start_alpha_p=a.get("start_alpha_p", 0.0), start_alpha_R=a.get("start_alpha_R", 0.0),
-            start_h_indices=[0],
-            T_target_Rp=T_target_Rp,
-            goal_alpha_p=a.get("goal_alpha_p", 0.0), goal_alpha_R=a.get("goal_alpha_R", 0.0),
-            goal_h_indices=goal_h,
-            smoothness_alpha_vel=a.get("smoothness_alpha_vel", 0.0),
-            smoothness_alpha_acc=a.get("smoothness_alpha_acc", 0.0),
-        )
+        if use_v51:
+            # v5.1: IK-free reverse — NO q_init, NO limiting_q_mean.
+            # Optional spec §12.5 alpha_s / alpha_g scaling honored if stored.
+            alpha_s = a.get("alpha_s")
+            alpha_g = a.get("alpha_g")
+            start_ap = (alpha_s * a.get("start_alpha_p", 0.0)
+                        if alpha_s is not None else a.get("start_alpha_p", 0.0))
+            start_aR = (alpha_s * a.get("start_alpha_R", 0.0)
+                        if alpha_s is not None else a.get("start_alpha_R", 0.0))
+            goal_ap = (alpha_g * a.get("goal_alpha_p", 0.0)
+                       if alpha_g is not None else a.get("goal_alpha_p", 0.0))
+            goal_aR = (alpha_g * a.get("goal_alpha_R", 0.0)
+                       if alpha_g is not None else a.get("goal_alpha_R", 0.0))
+            samples = traj_reverse_ou_chart_pose(
+                sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
+                n_steps=a["n_sample_steps"], goal_cond=goal_cond, z_e=z_e,
+                eps=a["eps"], device=device, dtype=dtype,
+                T_start_Rp=T_start_Rp,
+                start_alpha_p=start_ap, start_alpha_R=start_aR,
+                start_h_indices=[0],
+                T_target_Rp=T_target_Rp,
+                goal_alpha_p=goal_ap, goal_alpha_R=goal_aR,
+                goal_h_indices=goal_h,
+                smoothness_alpha_vel=a.get("smoothness_alpha_vel", 0.0),
+                smoothness_alpha_acc=a.get("smoothness_alpha_acc", 0.0),
+            )
+        else:
+            # Method A: per-traj q_init from x_demo[0]; legacy: None
+            q_init_eval = (x_demo[:, 0, :arm.n_q].detach().to(device=device, dtype=dtype)
+                           if a.get("method_a") else None)
+            samples = traj_reverse_grw_pose(
+                sde, score_fn, n_samples=args.n_eval_per_z, H=a["H"],
+                n_steps=a["n_sample_steps"], goal_cond=goal_cond, z_e=z_e,
+                limiting_q_mean=torch.tensor(a["limiting_mean_q"]),
+                q_init=q_init_eval, limiting_scale=a.get("limiting_scale"),
+                eps=a["eps"], device=device, dtype=dtype,
+                T_start_Rp=T_start_Rp,
+                start_alpha_p=a.get("start_alpha_p", 0.0), start_alpha_R=a.get("start_alpha_R", 0.0),
+                start_h_indices=[0],
+                T_target_Rp=T_target_Rp,
+                goal_alpha_p=a.get("goal_alpha_p", 0.0), goal_alpha_R=a.get("goal_alpha_R", 0.0),
+                goal_h_indices=goal_h,
+                smoothness_alpha_vel=a.get("smoothness_alpha_vel", 0.0),
+                smoothness_alpha_acc=a.get("smoothness_alpha_acc", 0.0),
+            )
         m = compute_pose_metrics(arm, samples, T_target,
                                   x_demo=x_demo, sigma_R=a["sigma_R"],
                                   q_rest_A=list(a["q_rest_A"]),
