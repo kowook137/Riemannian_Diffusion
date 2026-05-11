@@ -112,8 +112,13 @@ def main():
             p_box_lo=tuple(a["p_box_lo"]), p_box_hi=tuple(a["p_box_hi"]),
             z_e_range=(z_val, z_val), branch_p_A=a["branch_p_A"],
             jitter_q=a["jitter_q"], n_ik_steps=a["n_ik_steps"],
+            ik_alpha=a.get("ik_alpha", 0.5),
+            ik_alpha_null=a.get("ik_alpha_null", 0.3),
+            ik_lam=a.get("ik_lam", 0.05),
             R_anchor_axis_angle=tuple(a["R_anchor_aa"]),
             target_perturb_rad=target_perturb_rad,
+            ik_clamp_to_limits=a.get("ik_clamp_to_limits", False),
+            ik_clamp_margin_frac=a.get("ik_clamp_margin_frac", 0.001),
         )
         x_demo, _, _, T_target, T_start = demo.sample(args.n_eval_per_z, device=device, dtype=dtype)
         goal_cond = torch.cat([T_start, T_target], dim=-1)
@@ -146,7 +151,9 @@ def main():
             smoothness_alpha_acc=a.get("smoothness_alpha_acc", 0.0),
         )
         m = compute_pose_metrics(arm, samples, T_target,
-                                  x_demo=x_demo, sigma_R=a["sigma_R"])
+                                  x_demo=x_demo, sigma_R=a["sigma_R"],
+                                  q_rest_A=list(a["q_rest_A"]),
+                                  q_rest_B=list(a["q_rest_B"]))
         m["z_e"] = z_val
         metrics["per_z"].append(m)
         print(format_row(z_val, m))

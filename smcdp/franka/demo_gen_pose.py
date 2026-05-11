@@ -38,11 +38,20 @@ def _dls_ik_pose_step(
     alpha: float = 0.5,
     alpha_null: float = 0.3,
     lam: float = 0.05,
+    clamp_to_limits: bool = False,
+    clamp_margin_frac: float = 0.001,
 ) -> Tensor:
     """One DLS pose-IK iteration: body-frame twist + null-space rest bias.
 
     Uses the analytic Franka body-frame Jacobian (no learned residual) for
     deterministic, fast IK.
+
+    `clamp_to_limits` (Experiment_plan.md §2.2 Tier 1/2): if True, clip the
+    post-step q to (q_min + δ, q_max - δ) where δ = clamp_margin_frac · q_range.
+    This emulates a real-robot joint-limit-aware IK controller and ensures
+    boundary-active demo trajectories stay strictly feasible.  Default False
+    preserves Tier 0 (control) behavior — IK output may exceed limits when
+    seeds are aggressive, which is the failure mode we observed for v1 attempts.
     """
     R_q, p_q = arm.T_phi_Rp(q, z_e)                                           # (B, 3, 3), (B, 3)
     e = log_relative_Rp(R_q, p_q, *T_target_Rp)                               # (B, 6) body-frame twist
@@ -54,7 +63,13 @@ def _dls_ik_pose_step(
     eye7 = torch.eye(7, device=q.device, dtype=q.dtype)
     null_proj = eye7 - Jpinv @ J                                               # (B, 7, 7)
     d_null = (null_proj @ (q_rest - q).unsqueeze(-1)).squeeze(-1)              # (B, 7)
-    return q + alpha * d_main + alpha_null * d_null
+    q_next = q + alpha * d_main + alpha_null * d_null
+    if clamp_to_limits:
+        q_lo, q_hi = arm.joint_limits(device=q.device, dtype=q.dtype)         # (n_q,) each
+        q_range = q_hi - q_lo
+        delta = clamp_margin_frac * q_range
+        q_next = torch.minimum(torch.maximum(q_next, q_lo + delta), q_hi - delta)
+    return q_next
 
 
 class FrankaBimodalReachingDemoPose:
@@ -98,6 +113,11 @@ class FrankaBimodalReachingDemoPose:
         R_anchor_axis_angle: tuple[float, float, float] = (3.14159265, 0.0, 0.0),
         # Target rotation perturbation: each axis-angle component ~ Uniform[-perturb, +perturb] (rad).
         target_perturb_rad: float = 0.5235987756,                              # 30° in radians
+        # Experiment_plan.md §2.2 Tier 1/2: clamp IK output to (q_min+δ, q_max-δ)
+        # to keep boundary-active demos strictly feasible.  Default False
+        # preserves Tier 0 (control) behavior.
+        ik_clamp_to_limits: bool = False,
+        ik_clamp_margin_frac: float = 0.001,                                   # δ = 0.1% of q_range
     ):
         assert getattr(manifold, "n_q", 0) == 7
         assert getattr(manifold, "n_z", 0) == 1
@@ -113,6 +133,8 @@ class FrankaBimodalReachingDemoPose:
         self.branch_p_A = float(branch_p_A)
         self.jitter_q = float(jitter_q)
         self.n_ik_steps = int(n_ik_steps)
+        self.ik_clamp_to_limits = bool(ik_clamp_to_limits)
+        self.ik_clamp_margin_frac = float(ik_clamp_margin_frac)
         self.ik_alpha = float(ik_alpha)
         self.ik_alpha_null = float(ik_alpha_null)
         self.ik_lam = float(ik_lam)
@@ -200,6 +222,8 @@ class FrankaBimodalReachingDemoPose:
                     self.ik_arm, q_curr, z_e, (R_h_b, p_h_b), q_rest,
                     alpha=self.ik_alpha, alpha_null=self.ik_alpha_null,
                     lam=self.ik_lam,
+                    clamp_to_limits=self.ik_clamp_to_limits,
+                    clamp_margin_frac=self.ik_clamp_margin_frac,
                 )
             q_traj_list.append(q_curr)
         q_traj = torch.stack(q_traj_list, dim=1)                                # (n, H+1, 7)
@@ -223,9 +247,24 @@ class FrankaBimodalReachingDemoPose:
         x_flat = self.manifold.make_x(chart_slot_flat, z_flat)
         x = x_flat.reshape(n, H1, self.manifold.ambient_dim)
 
-        # 7. Pack T_target and T_start in storage form (q_R, p)
-        T_target_used = torch.cat([R_to_quat(R_end), p_end], dim=-1)            # (n, 7)
-        T_start_used = torch.cat([R_to_quat(R_start), p_start], dim=-1)         # (n, 7)
+        # 7. Pack T_target and T_start in storage form (q_R, p).
+        # Use *realized* endpoints T_φ(q_0, z_e) and T_φ(q_H, z_e), NOT the
+        # IK targets, so that the conditioning (T_start, T_target) is
+        # exactly consistent with the trajectory endpoints.  Critical for
+        # Tier 2: when IK clamps q to limits, the realized pose deviates from
+        # the IK target, and using the IK target as conditioning would teach
+        # the score net an inconsistent map.  For Tier 0 (no clamp + IK
+        # converges) this is byte-equivalent within IK tolerance.
+        #
+        # CHART-AWARE: when manifold is wrapped (BoundedChartPoseManifold),
+        # `manifold.T_phi_Rp` expects the chart slot u and applies psi(u)
+        # internally → passing physical q here would double-apply psi.
+        # Use the underlying base manifold's T_phi_Rp for physical q.
+        physical_arm = getattr(self.manifold, "base", self.manifold)
+        R_phi_0, p_phi_0 = physical_arm.T_phi_Rp(q_traj[:, 0, :], z_e)
+        R_phi_H, p_phi_H = physical_arm.T_phi_Rp(q_traj[:, -1, :], z_e)
+        T_start_used  = torch.cat([R_to_quat(R_phi_0), p_phi_0], dim=-1)        # (n, 7)
+        T_target_used = torch.cat([R_to_quat(R_phi_H), p_phi_H], dim=-1)        # (n, 7)
         return x, branch_A, z_e, T_target_used, T_start_used
 
     def sample_x(self, n: int, device=None, dtype=torch.float32) -> Tensor:

@@ -1,778 +1,406 @@
-# Task Success Diagnostic Plan
+# Mode Distribution 회복 — 진단 실험 설계
 
-**Goal**: Pos_err 0.30m → 0.10m 도달 (current 7-DoF Franka task)
+**목적**: Method A 의 mfe 0.12 (DP-* 대비 4–8× 나쁨) 의 root cause 를 분리하고, 가장 효과적인 fix 를 결정한다.
 
-**Current state**:
-- Mean이 cond 따라 이동 (cond pathway 작동)
-- Std 0.15-0.24m (분산 큼)
-- CFG sweep $w \in \{0, 1, 2, 4, 7, 12\}$, $w=0$이 최선 (CFG amplification 효과 없음)
+**Compiled**: 2026-05-11
+**Reference**: `pose_extension_report.md` §6.2, §7.6, §10.4 (mfe 수치), `boundary_metric_plan.md` §7 (mode metrics)
 
 ---
 
-## 0. 진단의 출발점 — Framing
+## 0. 배경 — 무엇을 진단하는가
 
-### 0.1 입증된 사실 (Geometric Substrate)
+### 0.1 현재 측정된 mfe 수치 정리
 
-본인 framework의 **geometric substrate**는 검증됨:
+`pose_extension_report.md` §7.6.3 + §10.3 통합:
 
-**3-DoF planar (D-2)**:
-- Mode averaging 0% (vs BC 100%, DP 3-9%)
-- W₁ 14-57x improvement
-- Pos_err 5-12x improvement vs baselines
-- OOD residual learning 30% 추가 개선
+| 모델 | mfe (전체 평균) | 의미 |
+|---|---|---|
+| DP-canonical | 0.015 | gen frac_A ∈ [0.485, 0.515], 거의 isotropic |
+| DP-channel | 0.033 | gen frac_A ∈ [0.467, 0.533] |
+| Projected | 0.035 | 비슷 |
+| v4.1 bounded | 0.047 | gen frac_A ∈ [0.453, 0.547] |
+| **Method A (v4)** | **0.12** | **gen frac_A ∈ {0.38, 0.62}, 1.6× imbalance** |
+| BC | 0.47 | 한 mode 만 (collapse) |
 
-**7-DoF Franka substrate**:
-- Sanity 6종 모두 machine precision pass
-  - $J_F^{\text{closed}} = J_F^{\text{autograd}}$
-  - Retraction이 $\Mphi$ 위 유지
-  - $J_g \cdot v = 0$ (auto-tangent)
-  - Norm equivalence
-  - $\N(0, G^{-1})$ sample (1.6% error)
-  - log/exp roundtrip exact
+Demo 의 frac_A = frac_B = 0.5 (bimodal). Ideal sampler 는 mfe → 0.
 
-**7-DoF Framework mechanism (§10 contributions)**:
-- C1: max $\|g_\phi\| = 0$ by construction, DSM loss 50→2 수렴
-- C2: Mode collapse 없음 (frac_A 0.40-0.51)
-- C3: $z_e$ generalization in-dist + OOD partial
+### 0.2 핵심 가설
 
-**Self-model accuracy**: 16.2mm → 0.29mm (55.8x improvement)
+Method A 만이 IK-derived $q^\text{init}$ 를 reference distribution center 로 사용. DP-* 는 standard Gaussian $\mathcal{N}(0, I)$ reference. **이 단일 차이가 mfe 격차의 dominant cause 일 가능성** 이 가장 높다.
 
-### 0.2 진단의 정확한 framing
+### 0.3 5 가지 원인 후보 (배경)
 
-**7-DoF sanity checks indicate that the geometric manifold substrate is correct.** 즉:
-- Manifold 정의, tangent bundle, induced metric, retraction 등 **geometric layer** 검증됨
-- Mathematical implementation 정확
+| # | 원인 | 검증 가능성 |
+|---|---|---|
+| A | IK seed 의 mode-biased selection | 직접 측정 가능 |
+| B | Reference distribution σ_K 와 mode coverage trade-off | ABL1 mfe 재측정 |
+| C | Score net 의 mode-asymmetric learning | 모델 내부 진단 |
+| D | Drift-free Brownian 의 mode-mixing 부재 | offline patch 측정 |
+| E | Statistical noise | 배제 (n=256, mfe 0.12 는 5σ 떨어짐) |
 
-**그러나 다음은 별도 진단 대상**:
-- **Probabilistic modeling layer**: demo distribution을 잘 capture하는지
-- **Task-level objective**: DSM loss와 task success 사이 alignment
-- **Trajectory smoothness prior**: product manifold가 component-wise이므로 temporal coupling은 score net 학습 의존
-- **Score-model capacity**: 7-DoF + sparse conditioning에 sufficient한지
-- **Sampling configuration**: discretization이 충분한지
-
-**The remaining 0.30 m task error is likely caused by data sharpness, conditioning strength, score-model capacity, sampling configuration, or task-level objective mismatch — rather than the geometric manifold construction.**
-
-### 0.3 진단의 진짜 의미
-
-이 plan은 **engineering optimization을 위한 systematic exploration**.
-
-본인이 옳은 길에 있고, 남은 건 probabilistic/task layer의 tuning. 가능한 source:
-- Score model architecture (conditioning injection 강도)
-- Demo distribution (within-mode spread, target bias)
-- Hyperparameter (limiting $\gamma$, training schedule, normalization)
-- Sampling configuration (K, $\Delta r$)
-- Loss design (endpoint weighting, DSM by-r decomposition)
+본 문서는 **A 와 D 를 가장 낮은 비용으로 분리** 하는 것을 목표.
 
 ---
 
-## 1. 가능한 Bottleneck
+## 1. 실험 1 — IK Mode Bias 직접 측정 (원인 A 검증)
 
-| Layer | 가능성 | Diagnostic 비용 | Layer type |
-|---|---|---|---|
-| (A) Demo distribution spread / bias | 높음 | 낮음 | Data |
-| (B) Conditioning signal weak | 높음 | 중간 | Implementation |
-| (C) Sampling discretization 부족 | 중간 | 매우 낮음 | Hyperparameter |
-| (D) DSM-task objective mismatch | 중간 | 낮음 | Loss design |
-| (E) Score model architecture 한계 | 중간 | 높음 | Implementation |
-| (F) Limiting distribution wide | 낮음 | 중간 | Hyperparameter |
-| (G) Training 부족 / 수렴 | 낮음 | 낮음 | Hyperparameter |
+### 1.1 가설
 
-**모든 bottleneck이 geometric substrate 외부 layer**. 낮은 비용부터 시작 → 원인 빨리 발견.
+> Method A 의 IK warm-start 가 단일 $q_\text{warm}$ ($q_\text{rest}$) 을 사용하므로, 같은 $T_\text{start}$ 의 두 mode 해 중 하나로 deterministic 하게 편향된다. 결과 IK solution 의 mode 분포가 50/50 이 아니다.
 
----
+### 1.2 Protocol
 
-## 2. Phase 1: Demo Distribution 분석 (최우선)
-
-**왜 먼저**: 가장 fundamental. Demo 자체가 spread하거나 target에서 biased면 모델 fix 무의미.
-
-### 2.1 Same-target demo std 측정
+#### Step 1: Eval condition 의 IK mode 분포 측정
 
 ```python
-dataset = load_demo_dataset()  # [N, 16, 7]
+# eval 에 쓰는 동일 T_start 100 개 sampling
+T_start_samples = sample_test_T_start(n=100)
 
-groups = group_by(dataset, ['p_target', 'mode'])
+mode_counts = {"A": 0, "B": 0}
+for T_start in T_start_samples:
+    # 현재 production 코드의 IK 호출 그대로
+    q_init = ik_step(T_start, q_warm=q_rest, n_steps=N_default)
 
-within_mode_std_q = []
-within_mode_std_pee = []
+    # mode classifier (이미 존재)
+    mode = mode_classifier(q_init)  # "A" or "B"
+    mode_counts[mode] += 1
 
-for (p_target, mode), demos in groups.items():
-    if len(demos) < 5:
-        continue
-    
-    q_traj = stack(demos.q)
-    std_q = std(q_traj, axis=0)
-    
-    p_ee_traj = batch_FK(q_traj)
-    std_pee = std(p_ee_traj, axis=0)
-    
-    within_mode_std_q.append(std_q)
-    within_mode_std_pee.append(std_pee)
-
-mean_std_q_at_h15 = mean([s[15] for s in within_mode_std_q], axis=0)
-mean_std_pee_at_h15 = mean([s[15] for s in within_mode_std_pee], axis=0)
+frac_A_IK = mode_counts["A"] / 100
+print(f"IK frac_A (single warm-start): {frac_A_IK:.3f}")
 ```
 
-**판단 기준**:
-- $\text{std}_{p_{ee}}$ at $h=15$ < 0.02m → Demo는 sharp. 모델 issue (Phase 2로)
-- $\text{std}_{p_{ee}}$ at $h=15$ in [0.02, 0.10]m → Demo가 적당. 모델도 부분 issue
-- $\text{std}_{p_{ee}}$ at $h=15$ > 0.10m → Demo가 main bottleneck
-
-### 2.2 Demo target bias (NEW)
-
-Std뿐 아니라 mean이 target에서 벗어나는지:
-
-$$
-\text{bias}(c, \text{mode}) = \left\| \E_{\text{demo}}[p_{ee, H} \mid c, \text{mode}] - p_{\text{target}} \right\|
-$$
+#### Step 2: Multi-warm-start IK 의 mode 분포 측정 (control)
 
 ```python
-target_bias = []
-for (p_target, mode), demos in groups.items():
-    p_ee_final = batch_FK(stack(demos.q))[:, 15, :]  # [n_demos, 3]
-    mean_p_ee_final = mean(p_ee_final, axis=0)
-    bias = norm(mean_p_ee_final - p_target)
-    target_bias.append(bias)
+mode_counts_random = {"A": 0, "B": 0}
+for T_start in T_start_samples:
+    # warm-start 를 demo 의 random subset 에서 sampling
+    q_warm = np.random.choice(demo_q_init_pool, 1)[0]
+    q_init = ik_step(T_start, q_warm=q_warm, n_steps=N_default)
+    mode = mode_classifier(q_init)
+    mode_counts_random[mode] += 1
 
-mean_target_bias = mean(target_bias)
+frac_A_IK_random = mode_counts_random["A"] / 100
+print(f"IK frac_A (random warm-start): {frac_A_IK_random:.3f}")
 ```
 
-**판단 기준**:
-- Bias < 0.02m → Demo가 target 잘 도달. Demo OK
-- Bias in [0.02, 0.05]m → 약간 bias. IK convergence 부족
-- Bias > 0.05m → Demo 자체가 target에서 벗어남. **Critical issue**
+### 1.3 판정 기준
 
-**중요**: Bias가 크면 모델이 demo를 정확히 학습해도 task fail. IK convergence threshold 재검토 필요.
-
-### 2.3 Per-target demo count 확인
-
-```python
-unique_targets = unique(p_target_list)
-demos_per_target = count_per_unique(p_target_list)
-
-print(f"Unique targets: {len(unique_targets)}")
-print(f"Demos per target: mean={mean}, min={min}, max={max}")
-```
-
-**기준**:
-- < 5 → 너무 적음. Sparse target distribution
-- > 50 → 충분
-- 그 사이 → 보통
-
-### 2.4 IK solver의 stochastic component 확인
-
-같은 (p_target, mode) 조합에 대해 10번 IK 돌려서 결과 std 측정.
-
-확인 사항:
-- Random initial joint configuration?
-- Null-space bias의 random component?
-- Convergence threshold가 sharp한지
-
-### 2.5 Phase 1 결정 분기
-
-| Demo std at end-EE | Demo target bias | 결론 | 다음 step |
-|---|---|---|---|
-| < 0.02m | < 0.02m | Demo OK | Phase 1.5로 (K sweep) |
-| 0.02-0.10m | < 0.02m | Demo 적당 spread | Phase 1.5 → Phase 2 |
-| > 0.10m | any | Demo spread main | Demo regenerate 우선 |
-| any | > 0.05m | Demo bias main | IK / demo gen fix 우선 |
-
----
-
-## 3. Phase 1.5: K Sweep Quick Test (NEW)
-
-**왜 일찍**: Retrain 없이 sampling discretization만 테스트. **매우 cheap한 진단**.
-
-### 3.1 Reverse step count sweep
-
-```python
-for K in [100, 200, 400, 800, 1600]:
-    samples = reverse_sde_sample(model, K_steps=K, n_samples=256)
-    pos_err_K = compute_pos_err(samples)
-    print(f"K={K}: pos_err={pos_err_K:.3f}m")
-```
-
-**판단 기준**:
-- K=200 vs K=800에서 pos_err 차이 < 0.02m → Sampling 충분. 다른 issue
-- 차이 > 0.05m → Sampling discretization 문제. K 증가가 fix
-- K 증가에도 pos_err 평행 → 다른 layer issue (Phase 2로)
-
-### 3.2 EMA / non-EMA model 비교
-
-```python
-pos_err_ema = evaluate(model_ema)
-pos_err_raw = evaluate(model_raw)
-```
-
-차이 크면 EMA 더 길게 또는 다른 EMA decay.
-
-### 3.3 Phase 1.5 결정 분기
-
-| K=200 → K=800 pos_err 변화 | 결론 |
+| frac_A^IK (single warm-start) | 진단 |
 |---|---|
-| > 0.05m 감소 | Sampling이 main bottleneck |
-| < 0.02m 감소 | Sampling sufficient, Phase 2로 |
-| 0.02-0.05m | 부분 contribution |
+| ∈ [0.45, 0.55] | 원인 A 배제. IK 는 mode-unbiased. 다른 원인 (D, C) 가 dominant. |
+| ∈ [0.35, 0.45] 또는 [0.55, 0.65] | 원인 A 부분적 기여. mfe 0.12 의 일부 설명 가능. |
+| ∉ [0.35, 0.65] | **원인 A 확정**. mfe 의 주된 cause. Solution 1 (mixture IK seed) 가 답. |
+
+### 1.4 비용
+
+- 학습 0
+- 컴퓨트: IK 200 회 (≈ 30 초)
+- 코드: 새 함수 0, 기존 IK 와 mode classifier 호출만
 
 ---
 
-## 4. Phase 2: DSM Loss 분해 진단 (NEW)
+## 2. 실험 2 — Reference 편향 전달 측정 (원인 D 검증)
 
-**왜 중요**: DSM loss 50→2 수렴이지만 task fail. **DSM loss vs task error의 alignment** 진단.
+### 2.1 가설
 
-### 4.1 Train vs Val DSM loss
+> 원인 A 가 dominant 가 아니어도, reference distribution 이 mode 간 unbalanced 한 경우 reverse SDE 가 그 편향을 endpoint 까지 전달한다. **현재 Method A 의 score net 이 정확하다면**, reference 를 strict 50/50 mode mixture 로 강제 patch 시 mfe 가 dramatic 하게 떨어져야 한다.
 
-```python
-train_loss = evaluate_dsm(model, train_data)
-val_loss = evaluate_dsm(model, val_data)
-```
+### 2.2 Protocol
 
-**판단 기준**:
-- Train loss 낮고 val loss 높음 → **Overfit**, data sparsity
-- 둘 다 높음 → **Underfit**, architecture / optimization 문제
-- 둘 다 낮은데 task fail → **Objective mismatch**
-
-### 4.2 Diffusion time $r$별 DSM loss
+#### Step 1: Demo 의 두 mode 의 rest configuration 추출
 
 ```python
-for r_bin in [0.0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0]:
-    loss_r = evaluate_dsm(model, val_data, r_range=r_bin)
-    print(f"r in {r_bin}: DSM loss={loss_r:.3f}")
+demo_q_init_pool = collect_demo_q_init()  # 모든 demo 의 첫 timestep q
+modes = [mode_classifier(q) for q in demo_q_init_pool]
+
+q_rest_A = mean([q for q, m in zip(demo_q_init_pool, modes) if m == "A"])
+q_rest_B = mean([q for q, m in zip(demo_q_init_pool, modes) if m == "B"])
 ```
 
-**판단 기준**:
-- High-noise time ($r$ → 1)에서 loss 큼 → **Reverse process early step 문제**
-- Low-noise time ($r$ → 0)에서 loss 큼 → **Final denoising 부정확**, sharpness 부족
-- 모든 $r$에서 균일 → Architecture capacity 한계
+#### Step 2: Offline patched sampling
 
-### 4.3 Condition / target 별 DSM loss
+기존 Method A ckpt 그대로. **Sampling 시 reference distribution 만 patch**:
 
 ```python
-for target_cluster in target_clusters:
-    loss_per_target = evaluate_dsm(model, val_data, condition=target_cluster)
+# 기존
+# q_init = ik_step(T_start, q_warm=q_rest)
+
+# Patch: 50/50 mixture IK
+def patched_q_init(T_start, sample_idx):
+    if sample_idx % 2 == 0:
+        return ik_step(T_start, q_warm=q_rest_A)
+    else:
+        return ik_step(T_start, q_warm=q_rest_B)
+
+# 나머지 sampling pipeline 동일
+q_init = patched_q_init(T_start, sample_idx)
+q_K ~ N(q_init, sigma_K^2 * G^{-1}(q_init))
+# reverse SDE 동일
 ```
 
-**판단 기준**:
-- 특정 target cluster에서 loss 큼 → **Conditioning 약함** for those clusters
-- 균일하면 conditioning OK
+#### Step 3: 전체 eval set 에서 mfe 재측정
 
-### 4.4 Phase 2 종합 진단 표
+`metric.md` 통합 eval set: 4 z_e × 64 samples × n_seed=1 = 256 trajectories.
 
-| DSM loss pattern | 해석 |
+```
+mfe_patched = compute_mfe(patched_trajectories, demo_frac_A=0.5)
+```
+
+### 2.3 판정 기준
+
+비교: 원본 mfe = 0.12 vs patched mfe.
+
+| Patched mfe | 진단 |
 |---|---|
-| Train low, val high | Overfit / data sparsity |
-| Train ≈ val, both high | Underfit / architecture |
-| Train ≈ val, both low + task fail | **Objective mismatch** |
-| High at r→1 | Reverse early step 문제 |
-| High at r→0 | Final sharpness 부족 |
-| High at specific c | Conditioning weak per-c |
+| ≤ 0.03 | **원인 D 확정**. Reference 편향 전달이 dominant. Solution 1 (mixture IK seed) 가 거의 완전한 fix. |
+| ∈ (0.03, 0.07] | 원인 D 의 큰 기여. Solution 1 으로 50–80% 개선 예상. |
+| ∈ (0.07, 0.10] | 원인 D 부분적. Score net 자체에 mode-asymmetric learning (원인 C) 도 기여. Solution 2 필요. |
+| > 0.10 | 원인 D 배제. 학습 자체의 문제 (원인 C). Solution 3 (mode-conditional) 또는 학습 변경 필요. |
+
+### 2.4 비용
+
+- 학습 0
+- 컴퓨트: eval 1 회 (256 trajectory) ≈ 2 시간 single GPU
+- 코드: sampling pipeline 의 IK 호출만 patch (~10 lines)
 
 ---
 
-## 5. Phase 3: Conditioning Signal 분석
+## 3. 실험 3 — ABL1 mfe 재측정 (원인 B 보정)
 
-### 5.1 Cond/uncond score 차이 measurement
+### 3.1 가설
+
+> σ_K calibration 이 pose succ 와 mode coverage 사이에 trade-off 가 있다. ABL1 (σ_K = 0.6, narrower) 가 succ 면에서 우수했던 (§6.2) 것이 mode coverage 희생의 결과일 수 있다.
+
+### 3.2 Protocol
+
+기존 ABL1 ckpt 이 있으면 mfe metric 만 계산.
 
 ```python
-def measure_cond_uncond_diff(model, dataset, n_samples=100):
-    diffs_norm = []
-    cond_norms = []
-    
-    for sample in dataset[:n_samples]:
-        x_r, c, z_e, r = sample.noised_state, sample.cond, sample.z_e, sample.diffusion_time
-        
-        with torch.no_grad():
-            s_cond = model(r, x_r, c, z_e)
-            s_uncond = model(r, x_r, null_token, z_e)
-        
-        diff = (s_cond - s_uncond).norm()
-        cond_norm = s_cond.norm()
-        
-        diffs_norm.append(diff.item())
-        cond_norms.append(cond_norm.item())
-    
-    relative_magnitude = mean(diffs_norm) / mean(cond_norms)
-    return relative_magnitude
+# ABL1 ckpt 로드
+ckpt_abl1 = load("franka_pose_method_a_abl1_sigma_K_0.6.pt")
+
+# 동일 eval set 으로 sampling, mfe 계산
+trajectories_abl1 = sample(ckpt_abl1, eval_conditions)
+mfe_abl1 = compute_mfe(trajectories_abl1, demo_frac_A=0.5)
 ```
 
-**기준**:
-- Relative magnitude < 0.05 → 매우 약함. Conditioning 거의 무시
-- 0.05-0.20 → 약함. CFG 효과 부족 이유
-- > 0.30 → 정상
+### 3.3 판정 기준
 
-### 5.2 Conditioning 방향성 alignment (NEW)
+비교: Method A mfe = 0.12 vs ABL1 mfe.
 
-Magnitude만 보면 부족. **방향성**도 확인:
+| ABL1 mfe | 진단 |
+|---|---|
+| ≤ 0.12 | σ_K = 0.6 이 succ + mfe 모두 우위. Method A 의 σ_K = 1.414 spec 정밀화가 mode 면에서 손해. |
+| > 0.12 (e.g. 0.20+) | σ_K = 1.414 가 mode coverage 면에서 우위. 현재 spec 유지가 옳음. |
+| ≈ 0.12 (variance 내) | σ_K 는 mfe 와 무관. 원인 A/D 만 결정적. |
 
-$$
-\cos\left(s_{\text{cond}} - s_{\text{uncond}}, \, \nabla_q R(q, c)\right)
-$$
+### 3.4 비용
 
-또는 더 직접: $(s_c - s_u)$ 방향으로 한 step 갔을 때 goal error가 줄어드는지.
+- 학습 0 (ckpt 재사용)
+- 컴퓨트: mfe 계산 (≈ 10 분 — 기존 eval data 재사용 가능)
+
+---
+
+## 4. 실험 4 (Conditional) — Score Net Mode-Asymmetric Learning 검증
+
+### 4.1 트리거 조건
+
+실험 2 의 patched mfe > 0.07 일 때만 실행. 즉 reference 를 strict 50/50 으로 만들어도 mfe 가 남으면, 원인 C (score net 자체) 진단.
+
+### 4.2 Protocol
+
+#### Step 1: Mode-별 validation loss 측정
 
 ```python
-def measure_cond_direction_alignment(model, samples, target):
-    eps = 0.01
-    for q, c, z_e in samples:
-        s_cond = model(r, q, c, z_e)
-        s_uncond = model(r, q, null_token, z_e)
-        
-        delta = (s_cond - s_uncond)  # chart vector
-        
-        # Goal error before and after step
-        p_before = forward_kin(q)
-        err_before = norm(p_before - target)
-        
-        q_new = q + eps * delta
-        p_after = forward_kin(q_new)
-        err_after = norm(p_after - target)
-        
-        delta_err = err_after - err_before  # 음수면 goal error 줄어듦
+# Demo 의 두 mode subset
+demo_A = [d for d in demos if mode_classifier(d.q[0]) == "A"]
+demo_B = [d for d in demos if mode_classifier(d.q[0]) == "B"]
+
+# 학습된 score net 의 loss 측정 (gradient update 없이)
+loss_A = compute_dsm_loss(score_net, demo_A, n_samples=200)
+loss_B = compute_dsm_loss(score_net, demo_B, n_samples=200)
+
+print(f"Per-mode DSM loss: A={loss_A:.4f}, B={loss_B:.4f}")
+print(f"Ratio: {max(loss_A, loss_B) / min(loss_A, loss_B):.2f}×")
 ```
 
-**기준**:
-- $\Delta e < 0$ (mean) → Conditioning이 goal 방향. CFG 효과 있어야 함
-- $\Delta e \geq 0$ → Conditioning이 강하지만 잘못된 방향 또는 noise
+#### Step 2: Mode-별 endpoint accuracy 측정
 
-**중요**: 본인의 CFG sweep에서 $w=0$이 최선이었던 것의 진짜 원인. Magnitude는 작거나, 방향이 잘못됐거나, 둘 다.
-
-### 5.3 Target shift 따라 mean shift 비율
-
-이미 진단됨. 비율 1.0이 ideal.
-
-### 5.4 Conditioning ablation
-
-같은 모델로:
-- Sample with correct $c$ → mean error
-- Sample with random $c$ → mean error
-- Sample with $c = \emptyset$ → mean error
-
-**기준**:
-- Correct $c$와 random $c$의 차이 작음 → Conditioning 거의 안 쓰임
-- 차이 큼 → Conditioning 사용됨, sharpness 부족
-
-### 5.5 FiLM layer activation 분석
-
-ConditionalUnet1D의 FiLM layer:
-- $\gamma_c, \beta_c$ output magnitudes
-- Layer별 conditioning strength
-
-특정 layer에서 nullified면 architecture issue.
-
-### 5.6 Phase 3 종합 결정 분기
-
-| Cond/uncond magnitude | Direction alignment | 결론 |
-|---|---|---|
-| < 0.10 | any | Conditioning broken / nullified |
-| 0.10-0.30 | $\Delta e < 0$ | Conditioning weak but correct direction |
-| 0.10-0.30 | $\Delta e \geq 0$ | Conditioning wrong direction |
-| > 0.30 | $\Delta e < 0$ | Conditioning OK, 다른 issue |
-| > 0.30 | $\Delta e \geq 0$ | Conditioning strong but wrong (architecture issue) |
-
----
-
-## 6. Phase 4: Limiting Distribution + 7-DoF 특화 Metric
-
-### 6.1 Forward process trajectory 확인
+Patched sampling (실험 2) 의 trajectory 를 mode A/B 로 split, 각각의 pose succ 비교:
 
 ```python
-For r in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
-    x_r ~ forward_sde(x_0, r)
-    measure std(x_r)
+trajectories_patched = sample_with_50_50_mixture(...)
+modes_gen = [mode_classifier(traj) for traj in trajectories_patched]
+
+succ_A = pose_succ([t for t, m in zip(trajectories_patched, modes_gen) if m == "A"])
+succ_B = pose_succ([t for t, m in zip(trajectories_patched, modes_gen) if m == "B"])
+
+print(f"Per-mode pose_succ: A={succ_A:.2%}, B={succ_B:.2%}")
 ```
 
-기대: 점진적으로 limiting까지 spread.
+### 4.3 판정 기준
 
-### 6.2 $\gamma$ tightening test (multi-metric)
+| 측정값 | 진단 |
+|---|---|
+| loss_A ≈ loss_B (ratio < 1.3×) AND succ_A ≈ succ_B | 원인 C 배제. mfe 잔여는 sampling stochasticity. |
+| loss_A / loss_B ≥ 1.5× | Score net 자체가 mode-asymmetric. 학습 시 mode-balanced batch sampling 필요. |
+| succ_A vs succ_B 가 > 10 pp 차이 | 한 mode 의 sample 이 manifold 다른 영역에 떨어져 score net coverage 부족. Solution 2 (mixture noising) 필요. |
 
-$\gamma = 0.6 \to 0.3$으로 retrain. **반드시 multi-metric 확인**:
+### 4.4 비용
 
-```python
-metrics = {
-    'pos_err': measure_pos_err(samples),
-    'mode_fraction': measure_frac_per_mode(samples),  # mode collapse?
-    'diversity_score': measure_diversity(samples),  # within-mode spread
-    'max_g_phi': measure_manifold_adherence(samples),  # 0 유지?
-    'smoothness': measure_smoothness(samples),  # NEW
-    'joint_limit_violation': measure_jl_viol(samples),  # NEW
-    'g_condition': measure_G_condition_number(samples),  # NEW
-}
-```
-
-**판단 기준**:
-- Pos_err 감소 + mode 유지 + smoothness OK → $\gamma$ tightening 채택
-- Pos_err 감소 but mode collapse → $\gamma$ 너무 tight, 중간값
-- Pos_err 변화 없음 → 다른 issue
-
-### 6.3 7-DoF 특화 Metrics (NEW)
-
-#### A. Joint limit violation
-$$
-\min_h \text{dist}(q_h, [q_{\min}, q_{\max}])
-$$
-Limit 근처에서 score 불안정 가능. 본인 측정값 1.5-2.1% (이미 OK).
-
-#### B. Trajectory smoothness
-$$
-\text{vel}: \sum_h \|q_{h+1} - q_h\|^2, \qquad \text{accel}: \sum_h \|q_{h+1} - 2q_h + q_{h-1}\|^2
-$$
-Pos는 맞아도 trajectory 거칠면 task success 낮음.
-
-#### C. $G$ condition number
-$$
-\kappa(G) = \frac{\lambda_{\max}(G)}{\lambda_{\min}(G)}
-$$
-7-DoF에서 metric conditioning이 sampling variance 좌우. 값이 크면 numerical instability.
-
-#### D. Endpoint vs full-trajectory error
-- Full trajectory pos_err: $\frac{1}{H+1} \sum_h \|p_h - p_{\text{target}}\|$
-- Endpoint pos_err: $\|p_H - p_{\text{target}}\|$
-
-차이 큼 → 모델이 horizon 전체를 맞추느라 endpoint sharpness 약함. **Endpoint loss reweighting fix 후보**.
-
-### 6.4 Phase 4 결정 분기
-
-| Metric | Result | Fix candidate |
-|---|---|---|
-| Endpoint err >> full traj err | Endpoint sharpness 약함 | Endpoint loss reweighting |
-| Smoothness 거침 | Trajectory smoothness 약함 | Smoothness regularization |
-| $\kappa(G)$ 큼 (>1000) | Metric conditioning 나쁨 | Manifold parametrization 재검토 |
-| $\gamma$ tightening 효과 | Limiting too wide | $\gamma$ 조정 |
+- 학습 0
+- 컴퓨트: validation loss ≈ 10 분, per-mode succ 는 실험 2 의 data 재사용
 
 ---
 
-## 7. Phase 5: Low-Cost Fixes (Architecture 변경 전)
+## 5. 의사결정 트리
 
-### 7.1 Condition normalization
-
-확인 사항:
-- $p_{\text{target}}$ scale (m 단위, 0-1 범위로 normalize?)
-- $z_e$ scale (이미 0.05-0.20)
-- $q$ scale (rad, joint limit 따라 normalize?)
-- $r$ scale ($t \times t_{\text{scale}}=1000$ 적절?)
-
-```python
-# Check input statistics
-print(f"p_target stats: mean={mean_p}, std={std_p}, range=[{min}, {max}]")
-print(f"z_e stats: ...")
-print(f"q stats: ...")
-```
-
-**Issue 발견 시**:
-- Per-channel normalization
-- Layer-wise scaling
-
-### 7.2 Endpoint loss reweighting
-
-현재 DSM loss는 trajectory 전체:
-$$
-\Loss = \sum_{h=0}^{H} \|s_{\theta, h} - a_h^*\|^2_G
-$$
-
-Endpoint sharpness를 위해:
-$$
-\Loss_{\text{weighted}} = \sum_{h=0}^{H} w_h \|s_{\theta, h} - a_h^*\|^2_G, \quad w_H \gg w_h \text{ for } h < H
-$$
-
-예: $w_H = 5$, $w_h = 1$ for others.
-
-### 7.3 Goal-conditioned residual guidance
-
-Phase 6 architecture 변경 전, sampling 시 goal residual guidance 추가:
-$$
-s_{\text{guided}}^q = s_\theta^q + \alpha \cdot G^{-1} \nabla_q \bar{R}(q, p_{\text{target}})
-$$
-
-여기서 $\bar R = -\|p_{ee}(q) - p_{\text{target}}\|^2$.
-
-본인 doc §9.2의 reward-based guidance가 정확히 이것. CFG와 별개로 적용 가능.
-
----
-
-## 8. Phase 6: Architecture 강화 (Last Resort)
-
-위 phase들로 fix 안 되면:
-
-### 8.1 Conditioning channel concat
-
-기존: global_cond [B, 4] → FiLM
-강화: q_traj concat with broadcast(p_target) → [B, 16, 7+3]
-
-매 timestep에서 target 정보 직접 access.
-
-### 8.2 Cross-attention
-
-ConditionalUnet1D에 cross-attention block 추가. Cond이 query/key로 작동.
-
-### 8.3 Per-layer FiLM 강화
-
-현재 FiLM이 일부 layer에서만 작동하면 모든 layer에 inject.
-
----
-
-## 9. 진행 순서
+실험 결과에 따라 Solution 선택:
 
 ```
-Phase 1 (Demo distribution + bias)
-    ↓
-Phase 1.5 (K sweep — quick, retrain 없음)
-    ↓
-Phase 2 (DSM loss decomposition — model retrain 없음)
-    ↓
-Phase 3 (Conditioning magnitude + direction)
-    ↓
-[중간 결정: Demo 문제? → demo regenerate, return Phase 1]
-    ↓
-Phase 4 (γ tightening multi-metric + 7-DoF metrics)
-    ↓
-Phase 5 (Low-cost fixes: normalization, endpoint reweighting, goal residual guidance)
-    ↓
-Phase 6 (Architecture 강화 — last resort)
+실험 1: frac_A^IK
+    ├─ ∈ [0.35, 0.65] → 원인 A 약함
+    └─ ∉ [0.35, 0.65] → 원인 A 확정
+
+실험 2: patched mfe
+    ├─ ≤ 0.03 → Solution 1 (mixture IK seed) 충분
+    ├─ ∈ (0.03, 0.07] → Solution 1 + Solution 2 hybrid 고려
+    ├─ ∈ (0.07, 0.10] → Solution 2 (mixture noising training) 필요
+    └─ > 0.10 → 실험 4 진행
+
+실험 3: ABL1 mfe
+    └─ σ_K 가 mfe 에 영향 있으면 Solution 4 (σ_K adjust) 추가 고려
+
+실험 4 (conditional):
+    ├─ loss ratio < 1.3× AND succ tied → Solution 1 + 2 결합으로 해결
+    └─ loss / succ 비대칭 → Solution 3 (mode-conditional) 또는 학습 시 mode-balanced sampling
 ```
 
 ---
 
-## 10. 결과 정리 Template
+## 6. Solution 후보 정리
 
-| Diagnostic | Result | Interpretation |
-|---|---|---|
-| Demo std at h=15 (p_ee) | ? m | Demo sharpness |
-| Demo target bias | ? m | Demo accuracy |
-| Per-target demo count | ? | Data density |
-| IK stochastic noise | ? m | Demo gen noise |
-| K=200 vs K=800 pos_err diff | ? m | Sampling sufficiency |
-| EMA vs raw pos_err diff | ? m | EMA sufficiency |
-| DSM train vs val loss | ?, ? | Overfit / underfit |
-| DSM loss by r (at r=1) | ? | Reverse early step |
-| DSM loss by r (at r=0) | ? | Final sharpness |
-| Cond - Uncond / Cond | ? | Conditioning magnitude |
-| Cond direction alignment | ? | Conditioning direction |
-| Random-c vs correct-c diff | ? m | Conditioning effect |
-| Forward SDE std at r=1 | ? | Limiting spread |
-| Endpoint vs full traj err | ? m | Endpoint sharpness |
-| Smoothness (vel, accel) | ?, ? | Trajectory quality |
-| $\kappa(G)$ | ? | Metric conditioning |
+진단 결과에 따라 적용할 fix:
 
----
+### Solution 1: Mixture IK warm-start
 
-## 11. Diagnostic 결과별 Fix Path
+- Sampling 시 $q_\text{warm}$ 을 $\{q_\text{rest}^A, q_\text{rest}^B\}$ 에서 50/50 random 선택
+- 학습 0, sampling code 10 lines
+- 예상: mfe 0.12 → 0.02–0.05
+- 적용 조건: 실험 2 patched mfe ≤ 0.05
 
-### 시나리오 A: Demo distribution 문제 (std > 0.10m or bias > 0.05m)
+### Solution 2: Mixture noising at training
 
-**Fix**:
-1. IK solver deterministic하게
-2. Per-target demo 수 증가
-3. Demo regeneration with tighter convergence
+- 학습 시 reference distribution 을 single Gaussian 이 아닌 50/50 mixture 로 변경
+- 학습 재실행 필요 (3 시간)
+- 예상: mfe → 0.02, 학습-sampling consistency 강화
+- 적용 조건: Solution 1 으로 부족 (mfe > 0.05 남음)
 
-**예상 효과**: Pos_err 0.30 → 0.15-0.20m
+### Solution 3: Mode-conditional sampling
 
-### 시나리오 B: Sampling discretization 부족 (K diff 큼)
+- Condition $c$ 에 mode index 추가
+- 학습 + sampling 둘 다 변경 (~4 시간)
+- 예상: mfe = 0 by construction, 그러나 metric 의미 약화
+- 적용 조건: Solution 1/2 모두 실패 시 fallback
 
-**Fix**:
-1. K = 400-800
-2. Step size 자동 schedule
+### Solution 4: σ_K sweep
 
-**예상 효과**: Pos_err 부분 개선
-
-### 시나리오 C: DSM-task objective mismatch (loss 낮은데 task fail)
-
-**Fix**:
-1. Endpoint loss reweighting
-2. Goal residual guidance (Phase 5.3)
-3. Per-r loss weighting
-
-**예상 효과**: Pos_err 0.30 → 0.10-0.15m
-
-### 시나리오 D: Conditioning weak/wrong (magnitude < 0.10 또는 direction off)
-
-**Fix options**:
-1. Condition normalization (Phase 5.1)
-2. Conditioning channel concat (Phase 6.1)
-3. Per-layer FiLM 강화
-
-**예상 효과**: Pos_err 0.30 → 0.05-0.10m
-
-### 시나리오 E: Limiting too wide (γ tightening 효과)
-
-**Fix**: $\gamma = 0.3$ + multi-metric 모니터링
-
-**예상 효과**: Pos_err 약간 개선
-
-### 시나리오 F: Endpoint sharpness 부족 (endpoint err >> full)
-
-**Fix**: Endpoint loss reweighting (Phase 5.2)
-
-**예상 효과**: Pos_err 부분 개선
-
-### 시나리오 G: 둘 이상 (가장 가능성 높음)
-
-순차적 fix.
+- ABL1 (σ_K=0.6), Method A (σ_K=1.414), 추가 (σ_K=1.0) 비교
+- 학습 0 (또는 1 회 재학습)
+- 적용 조건: 실험 3 에서 ABL1 mfe < 0.10 발견 시
 
 ---
 
-## 12. 사전 추측
+## 7. 실험 실행 순서 및 timeline
 
-현재 진단 패턴 (mean 맞음, std 큼, CFG 안 됨)을 보고 추측:
+### Day 0.5 (4 시간)
 
-**가능성 높은 시나리오** (확률 순):
+1. **실험 1** (IK mode bias): 30 분
+2. **실험 3** (ABL1 mfe 재측정): 10 분 (ckpt 있는 경우)
+3. **실험 2** (offline patched sampling): 2 시간
+4. 결과 분석 및 의사결정: 1 시간
 
-1. **Demo within-mode spread + conditioning weak/direction off** (40%)
-2. **DSM-task objective mismatch + endpoint sharpness** (25%)
-3. **주로 Demo spread or bias** (15%)
-4. **주로 Conditioning weak** (10%)
-5. **Sampling discretization + 기타** (10%)
+### Day 1 (Solution 적용)
 
-**가장 효과적 fix 추측 (low-cost)**:
-- Demo bias 확인 + IK fix
-- Endpoint loss reweighting
-- Condition normalization
-- Goal residual guidance
+진단 결과에 따라:
 
-이 셋만 해도 pos_err 0.10-0.15m 가능성 높음.
+- **Case Solution 1**: code patch + eval 재실행 (4 시간)
+- **Case Solution 2**: 학습 재실행 + eval (5 시간)
+- **Case Solution 3**: 학습 + eval + per-mode metric (6 시간)
 
----
+### Day 1.5 (Cross-validation)
 
-## 13. Implementation Files (제안)
-
-```
-experiments/
-├── diagnostic_phase1_demo.py
-│   ├── analyze_demo_distribution()
-│   ├── compute_target_bias()
-│   ├── compute_per_target_count()
-│   └── ik_stochastic_test()
-│
-├── diagnostic_phase1_5_sampling.py
-│   ├── k_sweep_test()
-│   └── ema_comparison()
-│
-├── diagnostic_phase2_dsm_decomp.py
-│   ├── train_val_loss_check()
-│   ├── loss_by_diffusion_time()
-│   └── loss_by_condition()
-│
-├── diagnostic_phase3_conditioning.py
-│   ├── measure_cond_uncond_diff()
-│   ├── measure_direction_alignment()
-│   ├── conditioning_ablation()
-│   └── analyze_film_activations()
-│
-├── diagnostic_phase4_limiting_metrics.py
-│   ├── forward_sde_trajectory()
-│   ├── gamma_tightening_retrain()
-│   ├── smoothness_metric()
-│   ├── g_condition_number()
-│   └── endpoint_vs_full_error()
-│
-└── diagnostic_phase5_lowcost_fixes.py
-    ├── condition_normalization()
-    ├── endpoint_loss_reweighting()
-    └── goal_residual_guidance()
-```
+- pose_succ@(5cm, 5°) 가 fix 후 유지되는지 확인
+- v4.1 bounded chart 에도 같은 fix 적용 (실험 보고서 §10 결과 일관성 유지)
+- per-mode Wasserstein 계산 (mfe 외 distribution 내부 분포까지 확인)
 
 ---
 
-## 14. Decision Tree
+## 8. 측정할 metric
 
-```
-Start
-│
-├── Geometric substrate correct? ✓ (sanity 6 + C1, C2, C3 입증)
-│   → Probabilistic/task layer 진단 대상
-│
-├── Phase 1: Demo std > 0.10m or bias > 0.05m?
-│   └── YES → Demo regenerate (Scenario A)
-│   └── NO  → Phase 1.5
-│
-├── Phase 1.5: K sweep으로 큰 변화?
-│   └── YES → Sampling fix (Scenario B)
-│   └── NO  → Phase 2
-│
-├── Phase 2: DSM loss 낮은데 task fail?
-│   └── YES → Objective mismatch (Scenario C, F)
-│   └── 다른 패턴 → 해당 fix
-│
-├── Phase 3: Cond/Uncond magnitude < 0.10 or direction wrong?
-│   └── YES → Conditioning fix (Scenario D)
-│   └── NO  → Phase 4
-│
-├── Phase 4: γ=0.3 retrain pos_err 크게 줄임 (multi-metric OK)?
-│   └── YES → γ tightening (Scenario E)
-│   └── NO  → Phase 5
-│
-├── Phase 5: Low-cost fixes (normalization, endpoint, goal guidance)
-│   └── 효과 → 정착
-│   └── 부족 → Phase 6
-│
-└── Phase 6: Architecture 강화 (last resort)
-```
+### 8.1 Primary
+
+- **mfe** = $|\text{frac}_A^\text{gen} - 0.5|$ (전체 eval set, ID 평균, OOD 분리)
+- per-mode pose_succ@(5cm, 5°) — Solution 적용 후 두 mode 모두 demo 수준 유지 확인
+
+### 8.2 Secondary
+
+- **per-mode Wasserstein**: 각 mode 내부에서 generated trajectory 가 demo 분포와 얼마나 가까운가
+  - `boundary_metric_plan.md` §7 의 mode metric
+  - mfe 만으로는 mode 비율만 보지만 W_1^A, W_1^B 는 mode 내부 분포 fidelity
+- **feasible_mode_rate** (v4.1 한정): 선택된 mode 가 joint feasibility 만족하는 비율
+
+### 8.3 Sanity
+
+- pose_succ@(5cm, 5°) ID 평균이 Solution 적용 후 ±2 pp 안에 유지되는가
+- manifold gap 0 유지
+- v4.1 의 경우 viol = 0% 유지
 
 ---
 
-## 15. 최종 목표
+## 9. v4 와 v4.1 둘 다 적용
 
-**Task success 도달**:
-- pos_err < 0.10m (target box 폭 0.10m 내)
-- success@2cm > 50%
-- mode capture 유지 (frac_A 0.40-0.60)
-- manifold adherence 유지 (max|g_φ| = 0)
-- smoothness OK
-- joint limit violation < 5%
+`pose_extension_report.md` §10 의 v4 vs v4.1 비교 일관성을 위해, 선택된 Solution 을 v4 와 v4.1 양쪽 모두에 적용한다.
 
-이 목표 도달 후:
-- Baseline 비교 (BC, DP, Projected)
-- §16 ablation studies
-- Paper writing
+**예상 결과 (Solution 1 의 경우)**:
+
+| 모델 | mfe (before) | mfe (after) | pose_succ ID (before) | pose_succ ID (after) |
+|---|---|---|---|---|
+| v4 Method A | 0.12 | 0.02–0.05 | 94.27% | 92–94% (약간 감소 가능) |
+| v4.1 bounded | 0.047 | 0.02–0.04 | 75.00% | 74–76% |
+
+pose_succ 의 약간 감소는 mode mixing 으로 인한 sample diversity 증가가 boundary case 에서 일부 sample 의 endpoint accuracy 를 낮출 가능성 — 측정 후 trade-off 평가.
 
 ---
 
-## 16. 핵심 인사이트 (Framing)
+## 10. 성공 기준
 
-### 16.1 검증된 것 vs 진단 대상
+### 10.1 Minimal
 
-**검증됨 (geometric substrate)**:
-- Manifold construction
-- Tangent bundle
-- Induced metric
-- Retraction
-- Score lift via $J_H$
+- Method A (v4) mfe ≤ 0.05 (현재 DP-channel 의 0.033 에 근접)
+- pose_succ@(5cm, 5°) ID 평균 ≥ 92% (현재 94.27% 에서 −2 pp 이내)
 
-**진단 대상 (probabilistic/task layer)**:
-- Demo distribution quality
-- Conditioning strength + direction
-- DSM-task objective alignment
-- Sampling sufficiency
-- Trajectory smoothness prior
-- Score-model capacity for 7-DoF + sparse cond
+### 10.2 Strong
 
-### 16.2 Engineering optimization의 의미
+- Method A mfe ≤ 0.03 (DP-canonical 의 0.015 에 근접)
+- per-mode Wasserstein 이 demo 와 차이 < 5%
+- v4.1 bounded chart 에서도 같은 수준 달성
 
-이 plan은 framework redesign이 아니라 **probabilistic/task modeling layer의 systematic optimization**.
+### 10.3 실패 시
 
-상대적으로 cheap한 fix들이 가능:
-- Demo regeneration
-- Endpoint loss reweighting
-- Goal residual guidance
-- Condition normalization
-- Conditioning channel concat (if needed)
-
-### 16.3 Paper 관점
-
-본인 framework의 진짜 contribution:
-- **Mathematical novelty**: Riemannian SGM on learned manifold
-- **Geometric correctness**: by-construction adherence + multi-modal + embodiment
-- **Validated**: 3-DoF categorical, 7-DoF mechanism
-
-이게 paper main. Task success는 engineering goal, achievable through this diagnostic.
+mfe 가 0.08 이상 남으면 → score net 자체에 fundamental mode-asymmetric learning. 학습 변경 (Solution 2/3) 또는 가중치 sampling 으로 demo 의 mode balance 학습 강제.
 
 ---
 
-## 17. 진단의 결과로 얻는 것
+## 11. 부록 — 실험 보고서와의 연결
 
-이 plan을 따르면:
+본 진단은 `pose_extension_report.md` 의 다음 항목을 보완:
 
-1. **Bottleneck 명확 식별**: 어느 probabilistic/task layer가 main인지
-2. **최소 cost로 fix path 결정**: Low-cost fix 우선, architecture 최후
-3. **Geometric substrate vs probabilistic layer 명확 구분**: Diagnostic이 framework correctness와 무관함을 명시
-4. **Paper writing 준비**: Engineering optimization 결과를 implementation detail section으로
+- §6.2 ABL3 분석에서 "Per-trajectory $q^\text{init}$ 이 결정적 contribution" 확인됨 — 본 실험은 그 $q^\text{init}$ 의 mode-bias 정량화
+- §7.6.3 핵심 finding 2 ("Method A mfe 0.12 는 DP variants 대비 4–8× 나쁨") — 본 실험은 그 원인 분리
+- §10.4 v4.1 의 mfe 0.047 (v4 대비 2.5× 개선) — 본 실험으로 이 개선이 의도된 효과인지 우연인지 확인 가능
 
-**Geometric manifold substrate는 검증됨. 남은 것은 probabilistic/task modeling layer의 systematic engineering.**
+본 진단 결과는 다음 후속 실험의 input:
+
+- `boundary_active_experiment_design.md` 의 Tier 2 실험에서 mode balance 가 task_succ 결정에 더 중요해질 가능성. 본 진단 fix 가 boundary-active experiment 의 사전 조건.

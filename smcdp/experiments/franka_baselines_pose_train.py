@@ -30,7 +30,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from smcdp.manifolds_pose import Franka7DoFPose
+from smcdp.manifolds_pose import Franka7DoFPose, BoundedChartPoseManifold
+from smcdp.charts import make_chart_from_manifold
 from smcdp.franka.self_model_pose import (
     PoseResidualMLP, LearnedSelfModelFranka7DoFPose,
 )
@@ -62,6 +63,27 @@ def parse_args():
     p.add_argument("--branch-p-A", type=float, default=0.5)
     p.add_argument("--jitter-q", type=float, default=0.05)
     p.add_argument("--n-ik-steps", type=int, default=10)
+    p.add_argument("--ik-alpha", type=float, default=0.5)
+    p.add_argument("--ik-alpha-null", type=float, default=0.3)
+    p.add_argument("--ik-lam", type=float, default=0.05)
+    p.add_argument("--ik-clamp-to-limits", action="store_true",
+                   help="Clamp post-step q to (q_min+δ, q_max-δ) at each IK "
+                        "iteration. Required for Tier 1/2 boundary-active demos "
+                        "(Experiment_plan.md §2.2).")
+    p.add_argument("--ik-clamp-margin-frac", type=float, default=0.001)
+    p.add_argument("--bounded-chart", action="store_true",
+                   help="v4.1: wrap manifold with TanhBoundedChart so chart slot "
+                        "stores u = psi^-1(q); psi(u) auto-enforces q in (q_min, q_max). "
+                        "For DP this turns dp_official into DP-bounded (joint feasibility "
+                        "by construction at sampling time).  See "
+                        "joint_limit_extension.tex Sec 3-5.")
+    p.add_argument("--lambda-floor", type=float, default=1e-4,
+                   help="Tikhonov floor on G_Q^A; only active when --bounded-chart.")
+    p.add_argument("--demo-pool-size", type=int, default=0,
+                   help="If > 0, pre-generate this many demos once at startup and "
+                        "sample minibatches from the cached pool during training. "
+                        "Default 0 = legacy online-resampling each step (slow with "
+                        "n_ik_steps=25).  Tier 2 recommended: 8192.")
     p.add_argument("--target-perturb-deg", type=float, default=30.0)
     p.add_argument("--R-anchor-aa", type=float, nargs=3,
                    default=[3.14159265, 0.0, 0.0])
@@ -128,6 +150,16 @@ def main():
     )
     arm._ensure_chain(torch.zeros(1, 7, device=device))
 
+    if args.bounded_chart:
+        arm = BoundedChartPoseManifold(
+            arm, make_chart_from_manifold(arm, bounded=True),
+            lambda_floor=float(args.lambda_floor),
+        )
+        print(f"[bounded-chart] enabled (TanhBoundedChart, λ_floor={args.lambda_floor:.1e}) "
+              f"— DP-bounded mode; chart slot = u, psi(u) auto-feasible.")
+    else:
+        print(f"[bounded-chart] disabled — DP-raw mode (chart slot = q in R^7).")
+
     # ---- Demo distribution (pose-extended) ----
     target_perturb_rad = args.target_perturb_deg * 3.14159265 / 180.0
     data = FrankaBimodalReachingDemoPose(
@@ -137,8 +169,11 @@ def main():
         z_e_range=(args.z_min, args.z_max),
         branch_p_A=args.branch_p_A, jitter_q=args.jitter_q,
         n_ik_steps=args.n_ik_steps,
+        ik_alpha=args.ik_alpha, ik_alpha_null=args.ik_alpha_null, ik_lam=args.ik_lam,
         R_anchor_axis_angle=tuple(args.R_anchor_aa),
         target_perturb_rad=target_perturb_rad,
+        ik_clamp_to_limits=args.ik_clamp_to_limits,
+        ik_clamp_margin_frac=args.ik_clamp_margin_frac,
     )
 
     H1 = args.H + 1
@@ -156,12 +191,16 @@ def main():
         ).to(device)
         scheduler = None
     elif args.baseline == "dp_official":
+        # clip_sample=False: q range exceeds [-1,1] (Franka q[5] ∈ (-0.087, 3.822)).
+        # The diffusers DDPM default clip_sample=True clips x_0 prediction to
+        # [-1, 1] each reverse step → unreachable for Tier 2 boundary modes.
         if args.cond_injection == "channel":
             model, scheduler = make_official_diffusion_policy(
                 n_q=n_q + CTX_DIM, global_cond_dim=None,
                 down_dims=list(args.down_dims),
                 diffusion_step_embed_dim=args.diff_step_embed,
                 n_train_timesteps=args.dp_train_timesteps,
+                clip_sample=False,
             )
         else:
             model, scheduler = make_official_diffusion_policy(
@@ -169,6 +208,7 @@ def main():
                 down_dims=list(args.down_dims),
                 diffusion_step_embed_dim=args.diff_step_embed,
                 n_train_timesteps=args.dp_train_timesteps,
+                clip_sample=False,
             )
         model = model.to(device)
     elif args.baseline == "projected":
@@ -178,6 +218,7 @@ def main():
             down_dims=list(args.down_dims),
             diffusion_step_embed_dim=args.diff_step_embed,
             n_train_timesteps=args.dp_train_timesteps,
+            clip_sample=False,
         )
         model = model.to(device)
     else:
@@ -196,11 +237,31 @@ def main():
         return min(1.0, (step + 1) / args.warmup_steps)
     lr_sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_lambda)
 
+    # ---- Optional: pre-generate demo pool (avoids online IK in training loop) ----
+    pool = None
+    if args.demo_pool_size > 0:
+        n_pool = int(args.demo_pool_size)
+        print(f"[demo-pool] pre-generating {n_pool} trajectories once "
+              f"(avoids per-step online IK)...")
+        with torch.no_grad():
+            x_p, _, z_p, T_t_p, T_s_p = data.sample(n_pool, device=device, dtype=dtype)
+        pool = (x_p, z_p, T_t_p, T_s_p)
+        print(f"[demo-pool] cached pool: x={tuple(x_p.shape)}, "
+              f"z_e={tuple(z_p.shape)}, T_target={tuple(T_t_p.shape)}, "
+              f"T_start={tuple(T_s_p.shape)}; {(x_p.numel()*x_p.element_size())/1e6:.1f} MB")
+
     # ---- Training loop ----
     losses = []
     pbar = tqdm(range(args.steps), desc=f"train {args.baseline} pose")
     for step in pbar:
-        x_demo, _, z_e, T_target, T_start = data.sample(args.batch, device=device, dtype=dtype)
+        if pool is not None:
+            idx = torch.randint(0, pool[0].shape[0], (args.batch,), device=device)
+            x_demo  = pool[0][idx]
+            z_e     = pool[1][idx]
+            T_target = pool[2][idx]
+            T_start  = pool[3][idx]
+        else:
+            x_demo, _, z_e, T_target, T_start = data.sample(args.batch, device=device, dtype=dtype)
         # ctx = (T_start, T_target, z_e) ∈ R^{15}
         ctx = torch.cat([T_start, T_target, z_e], dim=-1)
         q_demo = x_demo[..., :n_q]                                  # (B, H+1, 7)

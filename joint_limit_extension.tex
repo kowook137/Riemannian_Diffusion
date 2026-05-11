@@ -14,14 +14,13 @@
 \DeclareMathOperator{\Image}{Im}
 \DeclareMathOperator{\Vol}{Vol}
 \DeclareMathOperator{\tr}{tr}
-\DeclareMathOperator{\IK}{IK}
 \DeclareMathOperator{\SE}{SE}
 \DeclareMathOperator{\SO}{SO}
 \DeclareMathOperator{\so}{\mathfrak{so}}
 \DeclareMathOperator{\se}{\mathfrak{se}}
 \DeclareMathOperator{\Ad}{Ad}
 \DeclareMathOperator{\ad}{ad}
-\DeclareMathOperator{\sech}{sech}
+\DeclareMathOperator{\KL}{KL}
 
 % Commands
 \newcommand{\R}{\mathbb{R}}
@@ -32,13 +31,20 @@
 \newcommand{\Mphi}{\mathcal{M}_{\phi}}
 \newcommand{\Mset}{\mathcal{M}}
 \newcommand{\Mpose}{\mathcal{M}_\phi^{\text{pose}}}
+\newcommand{\Mbpose}{\mathcal{M}_\phi^{\text{b-pose}}}
 \newcommand{\Tphi}{T_\phi}
 \newcommand{\Hpose}{H_\phi^{\text{pose}}}
+\newcommand{\Hbpose}{H_\phi^{\text{b-pose}}}
 \newcommand{\Jpose}{J_{\text{pose}}}
+\newcommand{\JQ}{J^Q}
+\newcommand{\GQ}{G_Q}
+\newcommand{\GQbar}{\bar G_Q}
+\newcommand{\psimap}{\psi}
+\newcommand{\Dpsi}{D_\psimap}
 
 \title{Core Mathematical Formulation\\
-\large Joint-Limit Bounded Pose-SMCDP\\
-\normalsize (v4.1: bounded chart $u \in \R^{n_q}$ with $q = \psi(u) \in (q_{\min}, q_{\max})$, drift-free Brownian, $SE(3)$ pose, quaternion-aware)}
+\large Pose-Extended SMCDP v5.1: $\SE(3)$ Self-Model on Bounded Chart with OU Forward\\
+\normalsize (Corrected: Euclidean score convention, Convention-1 reverse SDE, honest feasibility tiering)}
 \author{}
 \date{}
 
@@ -46,680 +52,500 @@
 
 \maketitle
 
-\paragraph{Document version note.} This is v4.1. Changes from v4:
+\paragraph{Document version note.} This is v5.1, a corrected revision of v5 addressing five mathematical and three narrative issues identified in review. The substantive design (bounded chart + OU forward + IK-free reference) is unchanged from v5; the corrections concern convention precision, claim honesty, and notational consistency.
+
+\paragraph{Corrections from v5.}
+\begin{enumerate}[noitemsep, leftmargin=*]
+    \item \textbf{Finite-$K$ reference mismatch made explicit.} v5 occasionally claimed ``exact forward-reference match.'' Corrected: the OU process admits a closed-form stationary $p_\infty = \N(0, \GQbar^{-1})$ — this is the structural property absent in v4/v5-option-X. The forward marginal $p_K$ approaches $p_\infty$ only as $\tau(K) \to \infty$; at finite $K$ the mismatch is controlled by $\alpha(K) = e^{-\tau(K)/2}$ and must be measured empirically (\S\ref{sec:forward-reference-mismatch}).
+    \item \textbf{Arithmetic for $\beta_f$-$\alpha$ relation corrected.} v5 erroneously paired $\beta_f = 10$ with $\alpha(K) \approx 0.007$. Correct: $\beta_f = 10 \Rightarrow \tau(K) = 5 \Rightarrow \alpha(K) = e^{-2.5} \approx 0.082$. The value $\alpha \approx 0.007$ requires $\beta_f \approx 20$. (\S\ref{sec:beta-schedule}, table updated.)
+    \item \textbf{Score convention fixed to Euclidean.} v5 wrote the reverse SDE with $s_\theta^u$ preceded by $\GQbar^{-1}$ (suggesting Euclidean score) but wrote the DSM target with an extra $\GQ^{-1}$ factor (suggesting Riemannian gradient). v5.1 fixes: $s_\theta^u := \nabla_u \log p_r$ (Euclidean), and all target/reverse expressions are consistent with this definition (\S\ref{sec:score-conventions}).
+    \item \textbf{Reverse SDE sign convention pinned to Convention 1.} Forward time $r$, $\Delta r < 0$ on reverse pass. Standard Score-SDE style. v5 implicitly mixed Convention 1 and 2; v5.1 is unambiguous (\S\ref{sec:reverse-sde}).
+    \item \textbf{``Geodesic random walk'' removed.} v5 used this term loosely. The sampler is a chart-space OU sampler with graph retraction; not an intrinsic Riemannian Brownian motion under $\GQ$. v5.1 uses precise terminology (\S\ref{sec:sampling}).
+    \item \textbf{Pose-block term reclassified as auxiliary regularizer.} The $\Log_{\SE(3)}$ component is not an exact forward-transition score (since $T = \widetilde T_\phi(u, z_e)$ is a deterministic function of $u$). v5.1 names it ``pose-geometric consistency regularizer'' rather than ``hybrid DSM target.'' (\S\ref{sec:loss}).
+    \item \textbf{Conditioning channel claim corrected.} v5 said ``guidance is the sole conditioning channel.'' This is false: the score network input already contains $(T_\text{start}, T_\text{target}, z_e)$. v5.1: guidance is the \emph{non-network, non-IK explicit conditioning mechanism}, not the sole channel (\S\ref{sec:guidance}).
+    \item \textbf{Feasibility claim tiered.} v5 claimed ``feasibility by construction.'' v5.1 separates this into (a) joint feasibility (true by chart structure), (b) learned-manifold adherence (true by retraction, w.r.t.\ $\Tphi$ not true robot), and (c) true physical feasibility (depends on self-model accuracy; collision/torque/dynamics not addressed) (\S\ref{sec:feasibility-tiers}).
+    \item \textbf{``Riemannian SDE on the manifold'' claim weakened.} The forward SDE is a constant-coefficient OU on the chart $u$; it is not a metric-aware Riemannian Brownian motion under $\GQ(u, z_e)$. $\GQ$ enters only through weighting (loss, guidance preconditioning, tangent identity). v5.1 makes this distinction explicit (\S\ref{sec:forward-sde-positioning}).
+    \item \textbf{Reference-marginal match metric promoted to required evaluation.} $\KL(p_K \| p_\text{ref})$ or $W_2$ must be reported; it justifies the IK-free reference choice for the chosen $\beta_f$ (\S\ref{sec:eval}).
+\end{enumerate}
+
+\paragraph{What v5.1 retains from v5 (the core contribution).}
 \begin{itemize}[noitemsep]
-    \item \textbf{Bounded chart} $u \in \R^{n_q}$ with smooth diffeomorphism $\psi: \R^{n_q} \to (q_{\min}, q_{\max})$ replaces the unbounded chart $q$. The manifold $\Mpose(z_e)$ is unchanged; only the chart is changed (\S\ref{sec:bounded-chart}).
-    \item \textbf{Default chart construction (Choice A)}: ambient first component is $u$ itself, giving $G_Q^A = I_{n_q} + D_\psi^\top \Jpose^\top W \Jpose D_\psi$, lower-bounded by $I_{n_q}$ regardless of $D_\psi$. Choice B (ambient first component $\psi(u)$) is documented as alternative in Appendix~\ref{app:choice-b} (\S\ref{sec:choice-A}).
-    \item \textbf{Adaptive Tikhonov with floor}: $\lambda_Q^A = c_\lambda \tr(G_Q^A)/n_q + \lambda_\text{floor}$ — the floor is structurally less critical under Choice A but retained for safety (\S\ref{sec:tikhonov}).
-    \item \textbf{IK seed} obtained as $u^\text{init} = \psi^{-1}(q^\text{init})$ with safety clipping in $\eta$-space (initialization only, not sampling enforcement) (\S\ref{sec:ik-seed}).
-    \item \textbf{Joint-limit feasibility} guaranteed in the open interval $(q_{\min}, q_{\max})$ by construction (\S\ref{sec:contribution-claim}).
-    \item \textbf{Push-forward distortion --- mandatory pre-flight diagnostic}: 3-stage compounding effect (training warp $\to$ DSM target inflation $\to$ sampling asymmetry) characterized; demo-margin decision rule (1\%-tile $\geq 0.05$) introduced as deployment precondition (\S\ref{sec:reference-distribution}).
-    \item \textbf{Smoothness reward default switched to $q$-chart}: $\| \psi(u_{h+1}) - \psi(u_h) \|^2$ replaces $\| u_{h+1} - u_h \|^2$ as default for physical interpretability and baseline parity. $u$-chart form retained as documented alternative.
-    \item \textbf{Varadhan-target chart-Euclidean bias acknowledged}: $u_0 - u_r$ in $a^*_Q$ is structurally biased near chart boundary; this trade-off is intrinsic to Choice A (cannot coexist with global identity floor) and is reported as a known limitation rather than concealed (\S\ref{sec:dsm}, \S\ref{sec:contribution-claim}).
-    \item All other v4 elements preserved: drift-free Brownian forward, $\beta$-schedule, $SE(3)$ self-model with right-multiplicative residual, body-frame Jacobian, Varadhan DSM target structure, retraction sampling, multi-component guidance, quaternion implementation conventions.
+    \item Bounded chart $u = \tanh^{-1}(\ldots)$ giving joint feasibility by construction (\S\ref{sec:bounded-chart}).
+    \item OU forward with closed-form Gaussian transition kernel (\S\ref{sec:forward-sde}).
+    \item Closed-form stationary $p_\infty = \N(0, \GQbar^{-1})$ as the structural basis for IK-free reference, with $\GQbar$ data-independent and conditioning-independent (\S\ref{sec:reference-metric}, \S\ref{sec:reference-distribution}).
+    \item Closed-form OU score as the chart-block training target (exact, not Varadhan-approximated) (\S\ref{sec:loss}).
+    \item Self-model graph manifold $\Mbpose(z_e) = \{(u, T) : T = \Tphi(\psi(u), z_e)\}$ preserved (\S\ref{sec:manifold}).
+    \item Multi-component reward guidance for trajectory quality (\S\ref{sec:guidance}).
 \end{itemize}
 
-\paragraph{Notation conventions.} Throughout this document:
-\begin{itemize}[noitemsep]
-    \item $\SE(3) = \SO(3) \ltimes \R^3$: rigid pose configuration space.
-    \item $\se(3) \simeq \R^6$: $\SE(3)$ Lie algebra, identified with $(\rho, \omega) \in \R^3 \times \R^3$.
-    \item All tangent vectors on $\SE(3)$ are body-frame (right-trivialized): $\dot T = T \xi^\wedge$ for $\xi \in \se(3)$.
-    \item $u \in \R^{n_q}$: the (computational) bounded chart coordinate. $q = \psi(u) \in (q_{\min}, q_{\max}) \subset \R^{n_q}$: physical joint configuration.
-    \item Quaternions $\bar q_R \in S^3$ are an implementation representation of $\SO(3)$; mathematics is on $\SE(3)$.
-    \item Diffusion time $r \in [0, K]$, distinct from trajectory index $h \in \{0, \ldots, H\}$.
-    \item Goal/condition $c \in \mathcal{C}$, distinct from constraint $g_\phi$ and embodiment $z_e$.
-\end{itemize}
+\paragraph{Notation.} Diffusion time $r \in [0, K]$, forward direction. Reverse pass uses $\Delta r < 0$ (Convention 1). Chart variable $u \in \R^{n_q}$ throughout; physical joint $q = \psi(u) \in (q_\text{min}, q_\text{max})$ is the lifted readout. Constant reference metric $\GQbar$ versus position/embodiment-dependent induced metric $\GQ(u, z_e)$; these are distinct objects with distinct roles.
+
+\section{Bounded chart parameterization}
+\label{sec:bounded-chart}
+
+\paragraph{Chart map.}
+\begin{equation}
+q_i = \psi_i(u_i) = q_{\text{mid},i} + \frac{q_{\text{range},i}}{2} \tanh(u_i), \quad u_i \in \R.
+\end{equation}
+$\psi : \R^{n_q} \to (q_\text{min}, q_\text{max})$ is a smooth diffeomorphism onto the open interior. The boundary is approached only as $|u_i| \to \infty$.
+
+\paragraph{Chart differential.}
+\begin{equation}
+\Dpsi(u) = \mathrm{diag}\bigl((q_{\text{range},i}/2)\, \mathrm{sech}^2(u_i)\bigr) \succ 0 \quad \forall u.
+\end{equation}
+
+\paragraph{Joint feasibility by construction.} For finite $u$, $\psi(u) \in (q_\text{min}, q_\text{max})$ strictly. This is independent of training data, noise scale, or extrapolation.
+
+\paragraph{Saturation regime.} For $|u_i| > 3$, $\mathrm{sech}^2(u_i) < 0.01$. $\Dpsi$ near-singular; chart-space dynamics ill-conditioned. Practical operation should keep $\|u\|_\infty \lesssim 2$. The chart enforces the boundary as a hard limit, not as the operating regime.
 
 \section{Self-model learning}
 \label{sec:self-model}
 
-State: $x = (q, T) \in \R^{n_q} \times \SE(3)$, with $q \in \R^{n_q}$ the joint configuration and $T = (R, p) \in \SE(3)$ the end-effector pose. Embodiment $z_e \in \R^{n_z}$.
-
-\paragraph{Residual forward kinematics on $\SE(3)$.}
+Unchanged from v4. The self-model is defined on physical $q$:
 \begin{equation}
-T_\text{analytic}(q, z_e) = \begin{bmatrix} R_\text{analytic}(q, z_e) & p_\text{analytic}(q, z_e) \\ 0 & 1 \end{bmatrix} \in \SE(3).
+\Tphi(q, z_e) = T_\text{analytic}(q, z_e) \cdot \exp_{\SE(3)}\!\bigl(\xi_\phi(q, z_e)^\wedge\bigr).
 \end{equation}
-A learned residual twist $\xi_\phi(q, z_e) = (\rho_\phi, \omega_\phi) \in \se(3)$ is composed via right-multiplication (body-frame residual):
+Composition: $\widetilde T_\phi(u, z_e) := \Tphi(\psi(u), z_e)$.
+
+Constraint function: $g_\phi(x, z_e) = \Log_{\SE(3)}(\Tphi(q, z_e)^{-1} T)$.
+
+\section{Manifold on bounded chart}
+\label{sec:manifold}
+
 \begin{equation}
-\boxed{ \Tphi(q, z_e) = T_\text{analytic}(q, z_e) \cdot \exp_{\SE(3)}\!\bigl(\xi_\phi(q, z_e)^\wedge\bigr) }
+\Mbpose(z_e) = \bigl\{(u, T) : T = \widetilde T_\phi(u, z_e)\bigr\}.
 \end{equation}
-$\Tphi(q, z_e) = (R_\phi, p_\phi)$.
+Embedding: $\Hbpose(u, z_e) = (u, \widetilde T_\phi(u, z_e))$. The first ambient block is the chart $u$ (not $\psi(u)$).
 
-\paragraph{Constraint function on $\SE(3)$.}
-\begin{equation}
-g_\phi(x, z_e) = \Log_{\SE(3)}\!\bigl( \Tphi(q, z_e)^{-1} T \bigr) \in \se(3).
-\end{equation}
-$g_\phi(x, z_e) = 0 \iff T = \Tphi(q, z_e)$.
-
-\paragraph{Self-model loss.} With body-frame error twist $e_\text{self} = (e_\rho, e_\omega)$:
-\begin{equation}
-\Loss_\text{self}(\phi) = \E_{\D_\text{self}}\!\bigl[ w_p \| e_\rho \|^2 + w_R \| e_\omega \|^2 \bigr] + \beta_p \E\bigl[\| \nabla_q \rho_\phi \|_F^2\bigr] + \beta_R \E\bigl[\| \nabla_q \omega_\phi \|_F^2\bigr].
-\end{equation}
-$w_p, w_R$ reconcile unit mismatch; $\beta_p, \beta_R$ regularize residuals.
-
-\paragraph{Stage 1 training-domain assumption.} The self-model is trained on demo configurations $q \in [q_{\min}, q_{\max}]$ (i.e., demo IK respects joint limits). Consequently $\Tphi(q, z_e)$ is well-fitted only on this physical domain. The bounded chart formulation in subsequent sections ensures all sampled $q$ stay within this domain, preserving self-model validity.
-
-\section{Manifold from self-model}
-
-\paragraph{Self-model graph manifold (unchanged from v4).}
-\begin{equation}
-\Mpose(z_e) = \bigl\{ (q, T) \in \R^{n_q} \times \SE(3) : T = \Tphi(q, z_e) \bigr\}.
-\end{equation}
-This is an $n_q$-dimensional submanifold. Mathematical structure of $\Mpose$ does not depend on chart choice.
-
-\section{Bounded chart: $u$-parameterization}
-\label{sec:bounded-chart}
-
-\paragraph{Diffeomorphism $\psi$.} Define
-\begin{equation}
-\psi: \R^{n_q} \to (q_{\min}, q_{\max}), \qquad \psi_i(u_i) = q_{\text{mid}, i} + \frac{q_{\text{range}, i}}{2} \tanh u_i,
-\end{equation}
-where $q_{\text{mid}, i} = (q_{\min, i} + q_{\max, i})/2$, $q_{\text{range}, i} = q_{\max, i} - q_{\min, i}$. $\psi$ is a smooth diffeomorphism onto the open interval $(q_{\min}, q_{\max})$.
-
-\paragraph{Diagonal Jacobian.}
-\begin{equation}
-D_\psi(u) = \frac{\partial \psi}{\partial u} = \mathrm{diag}\!\left( \frac{q_{\text{range}, i}}{2} \sech^2 u_i \right)_{i=1}^{n_q} \in \R^{n_q \times n_q}_{>0}.
-\end{equation}
-$D_\psi(u)$ is positive-diagonal everywhere, with $D_\psi(u) \to 0$ as $|u_i| \to \infty$ (boundary degeneracy).
-
-\paragraph{Inverse map.}
-\begin{equation}
-\psi^{-1}(q)_i = \tanh^{-1}\!\left( \frac{2(q_i - q_{\text{mid}, i})}{q_{\text{range}, i}} \right).
-\end{equation}
-$\psi^{-1}$ is finite for $q \in (q_{\min}, q_{\max})$ and diverges at the boundary.
-
-\paragraph{Manifold parameterization via $u$.} Define
-\begin{equation}
-{\Hpose}^Q(u, z_e) = \bigl(\psi(u),\, \Tphi(\psi(u), z_e)\bigr) = \Hpose(\psi(u), z_e) \in \Mpose(z_e).
-\end{equation}
-${\Hpose}^Q: \R^{n_q} \times \mathcal{Z} \to \Mpose(z_e)$ is a bijection onto $\{(q, T) \in \Mpose(z_e) : q \in (q_{\min}, q_{\max})\}$.
-
-\paragraph{Manifold definition (refined).}
-\begin{equation}
-\boxed{ {\Mpose}^Q(z_e) = \bigl\{ (q, T) \in \R^{n_q} \times \SE(3) : q \in (q_{\min}, q_{\max}),\ T = \Tphi(q, z_e) \bigr\}. }
-\end{equation}
-This is $\Mpose(z_e)$ restricted to physically valid $q$, parameterized globally by $u \in \R^{n_q}$.
-
-\section{Differential structure (tangent bundle, $u$-chart)}
+\section{Differential structure}
 \label{sec:tangent}
 
-\paragraph{Geometric Jacobian (body-frame, in $u$-chart).} For chart velocity $\dot u$, the corresponding $q$-velocity is $\dot q = D_\psi(u) \dot u$, and the body-frame twist is
+\paragraph{Chart-coordinate body-frame Jacobian.}
 \begin{equation}
-\xi_\text{body}(u, \dot u, z_e) = \Jpose(\psi(u), z_e) D_\psi(u)\, \dot u \in \se(3).
-\end{equation}
-We define
-\begin{equation}
-\Jpose^Q(u, z_e) := \Jpose(\psi(u), z_e) \cdot D_\psi(u) \in \R^{6 \times n_q},
-\end{equation}
-so $\xi_\text{body} = \Jpose^Q(u, z_e) \dot u$.
-
-\paragraph{Tangent map (lift) — Choice A (default).}
-\label{sec:choice-A}
-The embedding differential $J_H^{Q,A}: \R^{n_q} \to \R^{n_q} \times \se(3)$ takes the chart-coordinate component as $u$ itself:
-\begin{equation}
-\boxed{ J_H^{Q,A}(u, z_e) = \begin{bmatrix} I_{n_q} \\ \Jpose^Q(u, z_e) \end{bmatrix} = \begin{bmatrix} I_{n_q} \\ \Jpose(\psi(u), z_e)\, D_\psi(u) \end{bmatrix} \in \R^{(n_q + 6) \times n_q}. }
-\end{equation}
-The codomain is the trivialized tangent space $\R^{n_q} \times \se(3)$. The first $\R^{n_q}$ block tracks $\dot u$ directly (unweighted Euclidean); the second $\se(3)$ block tracks the induced body-frame twist.
-
-\paragraph{Why Choice A.} Choice A makes $G_Q^A = I_{n_q} + (\Jpose^Q)^\top W \Jpose^Q$, which is structurally identical to v4's $G_\text{pose} = I_{n_q} + \Jpose^\top W \Jpose$ with $\Jpose$ replaced by $\Jpose^Q$. The identity term $I_{n_q}$ ensures $G_Q^A \succeq I_{n_q}$ globally, eliminating boundary degeneracy at the metric level. Choice B (ambient first component $q = \psi(u)$, giving $G_Q^B = D_\psi^\top G_\text{pose} D_\psi$) suffers from $G_Q^B \to 0$ at the boundary and requires an essential Tikhonov floor for stability; we document Choice B in Appendix~\ref{app:choice-b}.
-
-\paragraph{Tangent space.}
-\begin{equation}
-T_x {\Mpose}^Q = \Image J_H^{Q,A}(u, z_e) = \bigl\{ (\dot u,\, \Jpose^Q \dot u) : \dot u \in \R^{n_q} \bigr\} \subset \R^{n_q} \times \se(3).
+\JQ(u, z_e) = \Jpose(\psi(u), z_e) \cdot \Dpsi(u) \in \R^{6 \times n_q}.
 \end{equation}
 
-\paragraph{Constraint Jacobian (on-manifold).} At $x \in {\Mpose}^Q(z_e)$, in $(\dot u, \xi)$ coordinates:
+\paragraph{Tangent map.}
 \begin{equation}
-J_g^Q(x, z_e) \big|_{{\Mpose}^Q} = \begin{bmatrix} -\Jpose^Q(u, z_e) & I_6 \end{bmatrix} \in \R^{6 \times (n_q + 6)}.
+J_H^{\text{b-pose}}(u, z_e) = \begin{bmatrix} I_{n_q} \\ \JQ(u, z_e) \end{bmatrix}.
 \end{equation}
 
 \paragraph{On-manifold tangent identity.}
 \begin{equation}
-\boxed{ J_g^Q(x, z_e) \cdot J_H^{Q,A}(u, z_e) = -\Jpose^Q + \Jpose^Q = 0 \quad \text{on } {\Mpose}^Q(z_e). }
+J_g \cdot J_H^{\text{b-pose}} = 0 \quad \text{on } \Mbpose.
 \end{equation}
 
-\section{Induced Riemannian metric}
+\section{Induced metric (Choice A)}
 \label{sec:metric}
 
-\paragraph{Pose-tangent inner product on $\se(3)$ (unchanged).}
+\paragraph{Pose-tangent inner product.}
 \begin{equation}
-W = \begin{bmatrix} W_p & 0 \\ 0 & W_R \end{bmatrix} = \begin{bmatrix} \sigma_p^{-2} I_3 & 0 \\ 0 & \sigma_R^{-2} I_3 \end{bmatrix}, \qquad \sigma_p = 0.05\text{ m},\ \sigma_R = 0.1\text{ rad}.
-\end{equation}
-$W_p = 400$, $W_R = 100$.
-
-\paragraph{Trivialized ambient inner product.}
-\begin{equation}
-\widetilde W = \mathrm{diag}(I_{n_q}, W) \in \R^{(n_q + 6) \times (n_q + 6)}.
-\end{equation}
-First $n_q$ block (for $\dot u$): standard Euclidean. Last 6 block (for $\xi$): $W$-weighted.
-
-\paragraph{Chart-coordinate metric (Choice A).} For $a, b \in \R^{n_q}$:
-\begin{equation}
-\bigl\langle J_H^{Q,A} a,\, J_H^{Q,A} b \bigr\rangle_{\widetilde W} = a^\top b + (\Jpose^Q a)^\top W (\Jpose^Q b) = a^\top \bigl( I_{n_q} + (\Jpose^Q)^\top W \Jpose^Q \bigr) b.
-\end{equation}
-Therefore:
-\begin{equation}
-\boxed{ G_Q^A(u, z_e) = I_{n_q} + \Jpose^Q(u, z_e)^\top W \Jpose^Q(u, z_e) = I_{n_q} + D_\psi(u)^\top \Jpose(\psi(u), z_e)^\top W \Jpose(\psi(u), z_e)\, D_\psi(u). }
+W = \mathrm{diag}(W_p I_3, W_R I_3), \quad W_p = \sigma_p^{-2} = 400, \quad W_R = \sigma_R^{-2} = 100.
 \end{equation}
 
-\paragraph{Lower bound (key advantage of Choice A).}
+\paragraph{Induced chart-coordinate metric.}
 \begin{equation}
-G_Q^A(u, z_e) \succeq I_{n_q} \quad \forall u, z_e.
-\end{equation}
-The identity term provides a structural floor: $\lambda_{\min}(G_Q^A) \geq 1$, $\mathrm{cond}(G_Q^A) \leq 1 + \lambda_{\max}(\Jpose^Q{}^\top W \Jpose^Q)$. Boundary degeneracy ($D_\psi \to 0$) makes the second term vanish, so $G_Q^A \to I_{n_q}$ at the boundary — well-conditioned, not degenerate.
-
-\paragraph{Riemannian gradient (chart).} For $f: {\Mpose}^Q \to \R$ with chart pullback $\bar f(u) = f({\Hpose}^Q(u, z_e))$:
-\begin{equation}
-\nabla_\Mset f \;\leftrightarrow\; G_Q^A(u, z_e)^{-1} \nabla_u \bar f.
+\GQ(u, z_e) = I_{n_q} + {\JQ}^\top W \JQ \succeq I_{n_q}.
 \end{equation}
 
-\paragraph{Density convention.} Densities $p_r$ on ${\Mpose}^Q(z_e)$ with respect to Riemannian volume $d\Vol_\Mset = \sqrt{\det G_Q^A(u, z_e)}\, du$ (in $u$-chart).
+\paragraph{Role of $\GQ$ in v5.1.} $\GQ$ enters in three places, none of them as the diffusion noise covariance:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Loss weighting}: the score-matching loss can be $\GQ$-weighted (or weighted by $\GQ^{-1}$ or $I$) — ablation choice.
+    \item \textbf{Guidance preconditioning}: $G_\text{traj}^{-1} \nabla_u R$ as a natural-gradient-style guidance (this is heuristic, not from exact reverse SDE).
+    \item \textbf{Tangent verification}: $J_g \cdot J_H^{\text{b-pose}} = 0$ identity uses the structure of $\GQ = I + {\JQ}^\top W \JQ$.
+\end{enumerate}
+$\GQ$ \emph{does not} enter the forward SDE noise covariance — that role is played by the constant $\GQbar$.
 
-\subsection{Adaptive Tikhonov regularization (with floor)}
+\subsection{Adaptive Tikhonov}
 \label{sec:tikhonov}
+$\GQ^\text{reg} = \GQ + \lambda(u, z_e) I$, $\lambda = c_\lambda \tr(\GQ)/n_q$, $c_\lambda \approx 10^{-2}$.
 
-Even with $G_Q^A \succeq I_{n_q}$, the second term $D_\psi^\top \Jpose^\top W \Jpose D_\psi$ can be ill-conditioned when $W_p, W_R \gg 1$ in regions where $\Jpose D_\psi$ has large variance across directions. Retain adaptive regularization with floor:
-\begin{equation}
-\boxed{ G_Q^{A,\text{reg}}(u, z_e) = G_Q^A(u, z_e) + \lambda_Q(u, z_e) I_{n_q}, \qquad \lambda_Q(u, z_e) = c_\lambda \cdot \frac{\tr G_Q^A(u, z_e)}{n_q} + \lambda_\text{floor}, }
-\end{equation}
-with $c_\lambda \approx 10^{-2}$ and $\lambda_\text{floor} \approx 10^{-4}$. Since $G_Q^A \succeq I$, the adaptive term itself is bounded below by $c_\lambda$; $\lambda_\text{floor}$ provides additional safety against arithmetic underflow but is not load-bearing under Choice A. (Under Choice B, $\lambda_\text{floor}$ becomes essential — see Appendix~\ref{app:choice-b}.)
+\section{Reference metric \texorpdfstring{$\GQbar$}{Gbar}}
+\label{sec:reference-metric}
 
-\paragraph{Position-only consistency.} Setting $W_R = 0$ recovers $G_Q^A = I + D_\psi^\top J_v^\top W_p J_v D_\psi$, the bounded-chart position-only metric.
+Constant symmetric positive-definite matrix defining the OU stationary covariance $\GQbar^{-1}$. \textbf{Independent of $u$, $z_e$, $c$, and sample.}
 
-\paragraph{Unbounded chart specialization.} Setting $\psi(u) = u$ (i.e., $D_\psi = I$) recovers v4's $G_\text{pose} = I + \Jpose^\top W \Jpose$ exactly.
+\paragraph{Three options.}
+\begin{itemize}[noitemsep]
+    \item $\GQbar = I_{n_q}$: simplest, strongest data-independence claim. Stationary $\N(0, I_{n_q})$ isotropic.
+    \item $\GQbar = \GQ(0, \bar z_e)$ for fixed $\bar z_e$: tracks geometry at chart center, introduces hyperparameter $\bar z_e$.
+    \item $\GQbar = \E_{u_0 \sim p_\text{data}, z_e}[\GQ(u_0, z_e)]$: best forward-marginal match, but data-statistic-dependent (sampling-time still constant matrix, computed once).
+\end{itemize}
+Default: $\GQbar = I_{n_q}$. Ablate other options.
 
 \section{Trajectory product manifold}
 \label{sec:product-manifold}
 
-Trajectory $\tau = (x_0, \ldots, x_H)$, $x_h \in {\Mpose}^Q(z_e)$:
-\begin{equation}
-\tau \in ({\Mpose}^Q(z_e))^{H+1}, \qquad u_{0:H} = (u_0, \ldots, u_H) \in \R^{n_q(H+1)}.
-\end{equation}
+$\tau = (x_0, \ldots, x_H)$, $u_{0:H} \in \R^{n_q(H+1)}$. Product reference: $\bar G_\text{traj} = \mathrm{diag}(\GQbar, \ldots, \GQbar)$.
 
-\paragraph{Block-diagonal product chart metric.}
-\begin{equation}
-G_\text{traj}^{Q,A}(u_{0:H}, z_e) = \mathrm{diag}\bigl(G_Q^A(u_0, z_e), \ldots, G_Q^A(u_H, z_e)\bigr) \in \R^{n_q(H+1) \times n_q(H+1)}.
-\end{equation}
-
-\section{Riemannian SDE}
+\section{Forward SDE: variance-preserving OU on chart}
 \label{sec:forward-sde}
 
-Diffusion horizon $K = 1$. Pure Riemannian Brownian motion on ${\Mpose}^Q(z_e)$, no Langevin drift (drift-free regime preserved from v4).
-
-\subsection{Forward SDE}
-
+\paragraph{Chart-coordinate forward SDE.}
 \begin{equation}
-\boxed{ dX_r = \sqrt{\beta(r)}\, dB^\Mset_r, \qquad X_r \in {\Mpose}^Q(z_e). }
+\boxed{ du_r = -\tfrac{1}{2}\beta(r)\, u_r\, dr + \sqrt{\beta(r)}\, \GQbar^{-1/2}\, dW_r, \quad u_0 \sim p_\text{data}, \quad r \in [0, K]. }
 \end{equation}
 
-In $u$-chart:
+\subsection{Positioning: chart-space OU, not Riemannian Brownian on \texorpdfstring{$\Mbpose$}{M}}
+\label{sec:forward-sde-positioning}
+
+\paragraph{Honest characterization.} The forward SDE is a constant-coefficient OU process on the chart $u \in \R^{n_q}$. The diffusion matrix $\GQbar^{-1/2}$ is constant (independent of $u$); there is no Christoffel correction, no Laplace-Beltrami term, no $u$-dependent metric in the noise. This is \emph{not} a metric-aware Riemannian Brownian motion under $\GQ(u, z_e)$.
+
+\paragraph{Why this is the design choice, not a defect.} A true Riemannian OU under $\GQ$ would lose the closed-form Gaussian transition kernel; the small-$r$ behavior would revert to Varadhan-style approximation. The constant-coefficient choice trades intrinsic Riemannian geometry for an exact closed-form transition, which is what enables the IK-free claim. $\GQ$ still plays a role, just not as the noise covariance: it appears in loss weighting, guidance preconditioning, and tangent identities.
+
+\paragraph{Therefore.} The system is a \emph{chart-space OU sampler on a self-model graph manifold with Riemannian-weighted loss and natural-gradient-style guidance}. The manifold $\Mbpose$ enters via graph retraction at every step, not via the forward noise covariance.
+
+\subsection{Closed-form transition kernel}
+
+For constant diffusion matrix, the OU SDE admits a Gaussian transition:
 \begin{equation}
-du_r = \frac{\beta(r)}{2} \frac{1}{\sqrt{\det G_Q^A}} \partial_j\!\left(\sqrt{\det G_Q^A}\, (G_Q^A)^{ij}\right) dr + \sqrt{\beta(r)}\, \sigma(u_r)\, dW_r, \quad \sigma\sigma^\top = (G_Q^A)^{-1}.
+\boxed{ p_{r \mid 0}(u_r \mid u_0) = \N\!\bigl(u_r;\, \alpha(r)\, u_0,\, \sigma^2(r)\, \GQbar^{-1}\bigr), }
 \end{equation}
-The Itô-Stratonovich correction is implicitly absorbed by retraction-based geodesic random walks.
+\begin{equation}
+\alpha(r) := e^{-\tau(r)/2}, \qquad \sigma^2(r) := 1 - e^{-\tau(r)}, \qquad \tau(r) := \int_0^r \beta(s)\, ds.
+\end{equation}
 
-\paragraph{Non-stationarity warning.} The chart $u \in \R^{n_q}$ is non-compact. Pure Brownian on ${\Mpose}^Q$, in $u$-chart, has no stationary probability measure (same situation as v4). The bounded physical support $q \in (q_{\min}, q_{\max})$ does not change this: it is the chart that determines stationarity, not the image. We continue to use finite-time noising on $r \in [0, K]$, as in v3/v4.
+\paragraph{Exact Euclidean score.}
+\begin{equation}
+\boxed{ \nabla_{u_r} \log p_{r \mid 0}(u_r \mid u_0) = -\frac{\GQbar\, (u_r - \alpha(r)\, u_0)}{\sigma^2(r)}. }
+\end{equation}
+Closed-form, exact at all $r$, no Varadhan approximation.
 
-\subsection{$\beta$-schedule}
+\paragraph{Stationary distribution.}
+\begin{equation}
+p_\infty(u) = \lim_{r \to \infty} p_r(u) = \N(0, \GQbar^{-1}).
+\end{equation}
+Closed-form, data-independent, conditioning-independent.
+
+\subsection{$\beta$-schedule and finite-$K$ mismatch}
 \label{sec:beta-schedule}
 
-Linear: $\beta(r) = \beta_0 + r(\beta_f - \beta_0)$, $\beta_0 = 10^{-3}$, $\beta_f = 4$, $K = 1$.
-\begin{equation}
-\tau_\text{brown}(r) = \int_0^r \beta(s) ds = \beta_0 r + \tfrac12 (\beta_f - \beta_0) r^2, \qquad \tau_\text{brown}(K) \approx 2.0.
-\end{equation}
+Linear schedule: $\beta(r) = \beta_0 + r(\beta_f - \beta_0)$, $\beta_0 = 10^{-3}$, $K = 1$.
 
-\subsection{Reverse SDE}
-\begin{equation}
-dY_r = \beta(r) \nabla_\Mset \log p_{1-r}(Y_r)\, dr + \sqrt{\beta(r)}\, dB^\Mset_r.
-\end{equation}
+Cumulative: $\tau(K) = \beta_0 K + \tfrac{1}{2}(\beta_f - \beta_0) K^2$.
 
-\section{Score model}
-
-\paragraph{Score field.} $s_\theta(r, x, c, z_e) \in T_x {\Mpose}^Q$.
-
-\paragraph{Chart output and lift.} Network outputs $s_\theta^u \in \R^{n_q}$ in $u$-chart:
-\begin{equation}
-s_\theta^\text{amb}(r, x, c, z_e) = J_H^{Q,A}(u, z_e)\, s_\theta^u(r, u, c, z_e) = \bigl(s_\theta^u,\, \Jpose^Q\, s_\theta^u\bigr) \in \R^{n_q} \times \se(3).
-\end{equation}
-
-\paragraph{Tangent verification.} $J_g^Q J_H^{Q,A} = 0$ on ${\Mpose}^Q$.
-
-\section{Score matching loss (Riemannian DSM)}
-\label{sec:dsm}
-
-\paragraph{Varadhan asymptotic (small $\tau_\text{brown}(r)$).}
-\begin{equation}
-\nabla_\Mset \log p_{r \mid 0}(x_r \mid x_0) \;\approx\; \frac{1}{\tau_\text{brown}(r)} \mathrm{Log}_{\Mset, x_r}(x_0).
-\end{equation}
-
-\paragraph{Local approximation: trivialized ambient displacement.}
-\begin{equation}
-\boxed{ \delta x^\text{amb}_{r0} = \begin{pmatrix} u_0 - u_r \\ \Log_{\SE(3)}\!\bigl(\Tphi(\psi(u_r), z_e)^{-1} \Tphi(\psi(u_0), z_e)\bigr) \end{pmatrix} \in \R^{n_q} \times \se(3). }
-\end{equation}
-The first component is $u$-chart Euclidean displacement (unweighted, consistent with $\widetilde W$'s first block being $I_{n_q}$); the second is body-frame $\SE(3)$ logarithm.
-
-\paragraph{Chart target via weighted least-squares projection.}
-\begin{equation}
-a^*_Q(u_r, x_0) = \arg\min_{a \in \R^{n_q}} \bigl\| J_H^{Q,A}(u_r, z_e) a - \delta x^\text{amb}_{r0} \bigr\|_{\widetilde W}^2.
-\end{equation}
-Closed form (using $(J_H^{Q,A})^\top \widetilde W J_H^{Q,A} = G_Q^A$):
-\begin{equation}
-\boxed{ a^*_Q(u_r, x_0; z_e) = G_Q^A(u_r, z_e)^{-1} \bigl[ (u_0 - u_r) + \Jpose^Q(u_r, z_e)^\top W \Log_{\SE(3)}\!\bigl(\Tphi(\psi(u_r))^{-1} \Tphi(\psi(u_0))\bigr) \bigr]. }
-\end{equation}
-
-\paragraph{Three forms of the loss.}
-
-\textbf{(a) Ambient (full Riemannian):}
-\begin{equation}
-\Loss^\text{ambient} = \E\!\left[ w(r) \left\| s_\theta(r, x_r, c, z_e) - \frac{1}{\tau_\text{brown}(r)} \mathrm{Log}_{\Mset, x_r}(x_0) \right\|^2_{x_r, W} \right].
-\end{equation}
-
-\textbf{(b) Chart $G$-weighted (used in practice):}
-\begin{equation}
-\Loss^{\text{chart-}G} = \E\!\left[ w(r) (s_\theta^u - a^*_Q/\tau_\text{brown}(r))^\top G_Q^A(u_r, z_e) (s_\theta^u - a^*_Q/\tau_\text{brown}(r)) \right].
-\end{equation}
-
-\textbf{(c) Chart-Euclidean (computational approximation):}
-\begin{equation}
-\Loss^\text{chart-Eucl} \approx \E\!\left[ w(r) \left\| s_\theta^u - \frac{u_0 - u_r}{\tau_\text{brown}(r)} \right\|^2 \right].
-\end{equation}
-
-\paragraph{Loss weighting.} Default $w(r) = \tau_\text{brown}(r)$.
-
-\paragraph{Varadhan approximation bias near chart boundary (limitation).} The chart-Euclidean displacement $u_0 - u_r$ in $a^*_Q$ assumes a uniform inner product on the first ambient block ($\widetilde W$'s first block $= I_{n_q}$). This is structurally consistent with Choice A and gives the identity floor $G_Q^A \succeq I_{n_q}$ globally. However, the Varadhan asymptotic
-\[
-\nabla_\Mset \log p_{r|0}(x_r \mid x_0) \approx \tau_\text{brown}(r)^{-1}\,\Log_{\Mset, x_r}(x_0)
-\]
-is exact in the limit only when $G_Q^A$ is approximately constant between $u_r$ and $u_0$. Because $D_\psi(u) \to 0$ near the chart boundary while $D_\psi(0) = q_\text{range}/2$ at the chart center, the second term $D_\psi^\top \Jpose^\top W \Jpose D_\psi$ in $G_Q^A$ varies by 2--3 decades across the chart range when $W_p, W_R$ are large (default $W_p = 400$). The chart-Euclidean target $u_0 - u_r$ thus carries a position-dependent systematic bias for boundary-adjacent samples (i.e., trajectories with $\|u_h\|_\infty \gtrsim 2$).
-
-\textbf{Trade-off characterization.} Replacing the first block of $\widetilde W$ with a position-dependent weight $D_\psi(u)^2$ would make the chart inner product equivalent to physical $q$-space Euclidean and remove this bias, but would also restore boundary degeneracy ($G_Q^A \to 0$ as $D_\psi \to 0$), which is precisely what Choice A was constructed to avoid. The two desirable properties — (i) physical Euclidean equivalence on the chart slot and (ii) global identity floor on $G_Q^A$ — cannot be simultaneously enforced under any first-block weighting. We deliberately choose (ii) for numerical robustness, accepting (i)'s violation as a structural limitation. Empirical validation strategy: when demo modes satisfy the margin condition in \S\ref{sec:reference-distribution}, the bias is bounded; otherwise v4 (unbounded chart) should be preferred. See \S\ref{sec:contribution-claim} for the empirical re-validation list.
-
-\section{Sampling: retraction-based geodesic random walk}
-\label{sec:sampling}
-
-\paragraph{Graph retraction (bounded chart).}
-\begin{equation}
-\Retr_{(u, T)}^Q(\delta u) = \bigl(u + \delta u,\, \Tphi(\psi(u + \delta u), z_e)\bigr).
-\end{equation}
-Since $\psi: \R^{n_q} \to (q_{\min}, q_{\max})$ is a global diffeomorphism, $u + \delta u \in \R^{n_q}$ for any $\delta u$, and $\psi(u + \delta u) \in (q_{\min}, q_{\max})$ \textbf{automatically}. \textbf{No clipping is applied during sampling.}
-
-\paragraph{Tangent noise.}
-\begin{equation}
-\xi_k^u \sim \N\bigl(0,\, G_Q^A(u_k, z_e)^{-1}\bigr).
-\end{equation}
-
-\subsection{Reverse sampling step}
-\label{sec:sampling-step}
-
-\begin{align}
-\mu_{h, k}^u &= s_{\theta, h}^u(r_k, \tau_k, c, z_e) + m_h \cdot G_Q^A(u_{h, k}, z_e)^{-1} \nabla_{u_h} R_\text{total}(\tau_k, c) \\
-\delta u_{h, k} &= \beta(r_k)\, \Delta r \cdot \mu_{h, k}^u + \sqrt{\beta(r_k)\, \Delta r}\, \xi_{h, k}^u \\
-u_{h, k+1} &= u_{h, k} + \delta u_{h, k} \\
-x_{h, k+1} &= {\Hpose}^Q(u_{h, k+1}, z_e) = (\psi(u_{h, k+1}),\, \Tphi(\psi(u_{h, k+1}), z_e)).
-\end{align}
-
-\paragraph{Joint-limit feasibility (by construction).} For every $k$:
-\begin{equation}
-q_{h, k+1} = \psi(u_{h, k+1}) \in (q_{\min}, q_{\max}),
-\end{equation}
-strictly. The open interval is exact: $q = q_{\min}$ or $q = q_{\max}$ requires $u = \mp \infty$, never reached in finite-step sampling. (See \S\ref{sec:contribution-claim} for task-dependence remark.)
-
-\paragraph{Manifold adherence (by construction).} $\| g_\phi(x_{h, k+1}, z_e) \|_W = 0$ exactly.
-
-\subsection{Reference distribution: finite-time noising initialization}
-\label{sec:reference-distribution}
-
-\begin{equation}
-\boxed{ p_\text{ref}(\tau \mid c, z_e) \propto \prod_{h=0}^H \N\!\left(u_h;\, u^\text{init}(c, z_e),\, \tau_\text{brown}(K) \cdot G_Q^A(u^\text{init}, z_e)^{-1}\right). }
-\end{equation}
-where $u^\text{init} = \psi^{-1}(q^\text{init})$ (\S\ref{sec:ik-seed}).
-
-\paragraph{Push-forward to $q$-space.} The induced distribution on $q$ via $q = \psi(u)$:
-\begin{equation}
-p_\text{ref}^q(q) = p_\text{ref}^u(\psi^{-1}(q)) \cdot \bigl| \det D_\psi^{-1}(\psi^{-1}(q)) \bigr|.
-\end{equation}
-The Jacobian factor $|\det D_\psi^{-1}|$ diverges as $q$ approaches $q_{\min}$ or $q_{\max}$, so $p_\text{ref}^q$ may concentrate non-uniform mass near boundary. The distortion compounds across three stages:
-\begin{enumerate}[noitemsep]
-  \item \textit{Training distribution warp}: a $q$-space margin $\delta = (1-|\eta|)\, q_\text{range}/2$ produces $u = \tanh^{-1}(\eta)$, so $q$-margin of $5\%, 1\%, 0.1\%$ maps to $\|u\|$ of $\approx 1.47, 2.30, 3.45$. Boundary-adjacent demos dominate the score net's effective input range.
-  \item \textit{DSM target inflation}: for $u_0 = 3, u_r = 1$, the chart-Euclidean displacement $u_0 - u_r = 2$ corresponds to $\psi(u_0) - \psi(u_r) \approx 0.23 \cdot q_\text{range}/2$, a $\sim 9\times$ amplification of $q$-displacement into the score target.
-  \item \textit{Sampling asymmetry}: with $\sigma_u(K) = \sqrt{\tau_\text{brown}(K)} \approx 1.41$, an initialization at $u^\text{init} = 2$ covers $u \in [0.6, 3.4]$ and pushes nearly all $q$-mass to one side of $\psi(u^\text{init})$, breaking multimodal coverage.
-\end{enumerate}
-
-\paragraph{Pre-flight margin diagnostic (mandatory before bounded-chart deployment).} For demo set $\D = \{q_h^{(i)}\}$, define per-sample relative margin
-\begin{equation}
-m^{(i)}_h = \min_i \min\!\left( \frac{q_{h, i}^{(i)} - q_{\min, i}}{q_{\text{range}, i}},\ \frac{q_{\max, i} - q_{h, i}^{(i)}}{q_{\text{range}, i}} \right) \in (0, 0.5].
-\end{equation}
-Compute the empirical 1\%-tile and 5\%-tile of $\{m^{(i)}_h\}$ across all demo timesteps and trajectories. \textbf{Decision rule}:
-\begin{itemize}[noitemsep]
-  \item $\text{1\%-tile} \geq 0.05$ (5\% margin) and $\text{5\%-tile} \geq 0.10$: \textbf{safe} — push-forward distortion negligible. Proceed with bounded chart.
-  \item $0.01 \leq \text{1\%-tile} < 0.05$: \textbf{caution} — empirical mode-capture and OOD validation required before claiming joint-feasibility benefit. Compare bounded vs.\ unbounded mode capture explicitly.
-  \item $\text{1\%-tile} < 0.01$: \textbf{abort bounded chart} — demo distribution is incompatible with the assumed margin condition; v4 (unbounded chart with joint-violation reported as a metric) is the correct setting.
-\end{itemize}
-This check is a precondition for the joint-feasibility-by-construction claim (\S\ref{sec:contribution-claim}); deploying bounded chart on a demo set that fails the rule produces structurally biased training distributions and invalidates the multimodal coverage guarantee.
-
-\subsection{IK seed selection}
-\label{sec:ik-seed}
-
-For 7-DoF redundant manipulators:
-
-\paragraph{Procedure.}
-\begin{enumerate}[noitemsep]
-    \item Choose task-appropriate warm-start $q_\text{warm}$ (demo rest configuration).
-    \item Run IK: $q^\text{init} = \IK\text{-step}(T_\text{start};\, q_\text{warm}, n_\text{steps})$.
-    \item \textbf{Boundary safety in inverse map}: compute $\eta_i = \frac{2(q^\text{init}_i - q_{\text{mid}, i})}{q_{\text{range}, i}}$, clip $\eta_i \to \mathrm{clip}(\eta_i,\, -1+\epsilon,\, 1-\epsilon)$ with $\epsilon \approx 10^{-3}$, then $u^\text{init}_i = \tanh^{-1}(\eta_i)$.
-    \item For multimodal demos, $q_\text{warm}$ may be selected based on condition $c$.
-\end{enumerate}
-
-\paragraph{Important: clipping is initialization-only.} The $\epsilon$-clipping is applied \textbf{only when computing $u^\text{init}$ from $q^\text{init}$}, to avoid $\tanh^{-1} \to \pm\infty$ when IK output happens to be at the joint limit. \textbf{No clipping is applied to $u_{h, k}$ during reverse sampling}, since (i) $\psi$ already constrains $q = \psi(u) \in (q_{\min}, q_{\max})$ for any finite $u$, and (ii) clipping during sampling would create training-sampling mismatch (score net trained on unclipped $u$ trajectories cannot be safely applied to clipped trajectories).
-
-\subsection{Implementation remark on rotation representation (quaternion)}
-\label{sec:quaternion}
-
-While $\Tphi(q, z_e) \in \SE(3)$ mathematically, implementations store $R_\phi$ as a unit quaternion $\bar q_R \in S^3$. Conventions (unchanged from v4):
-\begin{itemize}[noitemsep]
-    \item \textbf{Unit-norm preservation}: enforced by recomputing $\bar q_R$ via $\Tphi$ at every retraction, not by additive update.
-    \item \textbf{Double-cover ambiguity}: irrelevant since rotation operations go through $R$ or $\Log_{\SO(3)}$.
-    \item \textbf{Hemisphere consistency} for trajectory storage: $\bar q_{R, h}^\top \bar q_{R, h-1} \geq 0$.
-    \item \textbf{Storage form on the manifold}: $(u, q, \bar q_R, p, z_e)$ where $q = \psi(u)$ is the physical joint configuration. All autograd-critical operations performed via $(R, p)$-tuple.
-    \item \textbf{Quaternion validity as auxiliary metric}: $e_\text{quat-norm} = |\|\bar q_R\|_2 - 1| \approx 0$ to machine precision by construction.
-\end{itemize}
-
-\section{Goal-conditioned guidance}
-
-Conditional score: $s_\theta(r, x, c, z_e) \approx \nabla_\Mset \log p_r(x \mid c, z_e)$.
-
-\paragraph{Reward-based guidance (chart form).}
-\begin{equation}
-s_\text{guided}^u = s_\theta^u + \alpha\, G_Q^A(u, z_e)^{-1} \nabla_u \bar R(u, c).
-\end{equation}
-$\nabla_u \bar R$ via automatic differentiation through $\Tphi(\psi(u), z_e)$. Closed-form expressions in Appendix~\ref{app:closed-form-grad}.
-
-\section{Application-specific extension (trajectory-level guidance)}
-
-\subsection{Condition extension}
-
-$c = (T_\text{start}, T_\text{target}, z_e)$, $T_\text{start}, T_\text{target} \in \SE(3)$. Score network input per timestep $h$:
-\begin{equation}
-\text{input}_h = [u_h, r, h/H, z_e, T_\text{start}, T_\text{target}].
-\end{equation}
-
-\paragraph{Choice of network input chart.} Network input is $u_h$ (not $q_h = \psi(u_h)$) for consistency with score output $s_\theta^u$ being in $u$-chart. The pose components $T_\text{start}, T_\text{target}$ are still in $\SE(3)$ (parameterized as $(p, \bar q_R)$ for input).
-
-\subsection{Trajectory-level Riemannian gradient}
-
-\begin{equation}
-\nabla_{\Mset^{H+1}} R(\tau) \;\leftrightarrow\; G_\text{traj}^{Q,A}(u_{0:H}, z_e)^{-1} \nabla_{u_{0:H}} \bar R(\tau).
-\end{equation}
-
-\subsection{Trajectory-level guidance}
-
-\begin{equation}
-\boxed{ s_\text{guided}^u = s_\theta^u + G_\text{traj}^{Q,A}(u_{0:H}, z_e)^{-1} \nabla_{u_{0:H}} R_\text{total}(\tau, c). }
-\end{equation}
-
-\subsection{Multi-component pose reward}
-
-\begin{equation}
-R_\text{total}(\tau, c) = \alpha_s R_\text{start} + \alpha_g R_\text{goal} + \alpha_v R_\text{vel} + \alpha_a R_\text{acc}.
-\end{equation}
-
-\paragraph{Pose start anchoring.}
-\begin{equation}
-e_\text{start}(u_0, z_e) = \Log_{\SE(3)}\!\bigl(\Tphi(\psi(u_0), z_e)^{-1} T_\text{start}\bigr) = (e_\rho^s, e_\omega^s),
-\end{equation}
-\begin{equation}
-R_\text{start} = -(\alpha_p^s \| e_\rho^s \|^2 + \alpha_R^s \| e_\omega^s \|^2).
-\end{equation}
-
-\paragraph{Pose endpoint guidance.}
-\begin{equation}
-e_\text{goal}(u_H, z_e) = \Log_{\SE(3)}\!\bigl(\Tphi(\psi(u_H), z_e)^{-1} T_\text{target}\bigr),
-\end{equation}
-\begin{equation}
-R_\text{goal} = -(\alpha_p^g \| e_\rho^g \|^2 + \alpha_R^g \| e_\omega^g \|^2).
-\end{equation}
-
-\paragraph{Smoothness in $q$-chart (default).}
-\begin{equation}
-\boxed{ R_\text{vel} = -\sum_{h=0}^{H-1} \| \psi(u_{h+1}) - \psi(u_h) \|^2, \qquad R_\text{acc} = -\sum_{h=1}^{H-1} \| \psi(u_{h+1}) - 2 \psi(u_h) + \psi(u_{h-1}) \|^2. }
-\end{equation}
-Gradient via autograd through $\psi$. The $q$-chart form is the default because:
-\begin{itemize}[noitemsep]
-  \item \textit{Physical interpretation}: $q$ is the physical joint configuration; smoothness in $q$ corresponds to smooth motor commands.
-  \item \textit{Baseline parity}: BC and DP baselines operate in $q$-space, so cross-method smoothness comparison is consistent only in $q$-chart.
-  \item \textit{Boundary auto-damping}: $\nabla_{u_h} \| \psi(u_{h+1}) - \psi(u_h) \|^2$ contains $D_\psi(u_h)$ and $D_\psi(u_{h+1})$ factors, so smoothness gradient automatically vanishes near the chart boundary. This complements the $u$-chart structure of the score: large $u$-jumps near boundary (corresponding to small physical motion) carry small smoothness penalty, consistent with their small physical effect.
-  \item \textit{Cross-method fairness}: smoothness as an evaluation metric must be reported in $q$-chart to compare bounded-chart Method A against unbounded baselines without chart-induced bias.
-\end{itemize}
-
-\paragraph{Smoothness in $u$-chart (alternative).}
-\begin{equation}
-R_\text{vel}^u = -\sum_{h=0}^{H-1} \| u_{h+1} - u_h \|^2, \qquad R_\text{acc}^u = -\sum_{h=1}^{H-1} \| u_{h+1} - 2 u_h + u_{h-1} \|^2.
-\end{equation}
-$u$-chart smoothness does not equal physical-joint smoothness: near joint center ($u \approx 0$), $D_\psi \approx q_\text{range}/2 \cdot I$ is approximately constant and the two are proportional, but near boundary, $D_\psi \to 0$ allows large $\|u_{h+1} - u_h\|$ for vanishing $\|q_{h+1} - q_h\|$. This can produce trajectories that are smooth in physical joint space but ``jerky'' in $u$-coordinates --- harmless physically but inconsistent with the chart-Euclidean noise process used in sampling. Use $R_\text{vel}^u$ only when chart-Euclidean smoothness is explicitly desired (e.g., to penalize the score net's effective $u$-input range).
-
-\subsection{Tangent verification (trajectory-level)}
-$J_g^Q(x_h, z_e) \cdot [J_H^{Q,A}(u_h, z_e)\, s_{\text{guided}, h}^u] = 0$.
-
-\subsection{Reverse sampling step with guidance}
-
-\begin{align}
-\mu_{h, k}^u &= s_{\theta, h}^u + m_h \cdot G_Q^A(u_{h, k}, z_e)^{-1} \nabla_{u_h} R_\text{total} \\
-\delta u_{h, k} &= \beta(r_k) \Delta r \cdot \mu_{h, k}^u + \sqrt{\beta(r_k) \Delta r} \cdot \xi_{h, k}^u \\
-u_{h, k+1} &= u_{h, k} + \delta u_{h, k} \\
-x_{h, k+1} &= {\Hpose}^Q(u_{h, k+1}, z_e).
-\end{align}
-
-\section{Evaluation metrics}
-
-\paragraph{Manifold adherence.} $\max_h \| g_\phi(x_h, z_e) \|_W = 0$ (by construction).
-
-\paragraph{Joint limit feasibility (new).}
-\begin{equation}
-\text{viol}(\tau) = \frac{1}{(H+1) n_q} \sum_h \sum_i \mathbb{1}[\psi(u_{h, i}) \notin (q_{\min, i}, q_{\max, i})] = 0 \quad \text{by construction}.
-\end{equation}
-Bounded chart guarantees $\text{viol}(\tau) = 0$ exactly. Reported as zero for sanity check.
-
-\paragraph{Joint margin (auxiliary).}
-\begin{equation}
-\text{margin}(\tau) = \min_{h, i} \min\bigl(q_{h, i} - q_{\min, i},\, q_{\max, i} - q_{h, i}\bigr).
-\end{equation}
-Diagnostic: how close trajectories pass to joint boundary. Small margin with positive $\text{viol} = 0$ indicates the chart is being used near its full range.
-
-\paragraph{$u$-norm distribution (diagnostic).}
-\begin{equation}
-\| u_{h} \|_\infty \text{ percentiles across trajectories}.
-\end{equation}
-Large $\|u\|_\infty$ (e.g., $> 3$) indicates saturation regime where $D_\psi$ is small. Used to assess whether the bounded chart's effective dimension is being exercised.
-
-\paragraph{Endpoint position error.} $e_p(\tau) = \| p_\phi(\psi(u_H), z_e) - p_\text{target} \|_2$. Reported in cm.
-
-\paragraph{Endpoint rotation error (geodesic).} $e_R(\tau) = \| \Log_{\SO(3)}(R_\phi(\psi(u_H), z_e)^\top R_\text{target}) \|$. Reported in degrees.
-
-\paragraph{Pose success rate.} $\text{succ}@(\rho_p, \rho_R)$ as in v4.
-
-\paragraph{Quaternion validity (auxiliary).} $e_\text{quat-norm} \approx 0$ by construction.
-
-\paragraph{Trajectory smoothness ($u$-chart and $q$-chart).}
-\begin{equation}
-\text{vel}^u(\tau) = \frac{1}{H} \sum \| u_{h+1} - u_h \|, \qquad \text{vel}^q(\tau) = \frac{1}{H} \sum \| \psi(u_{h+1}) - \psi(u_h) \|.
-\end{equation}
-Both reported.
-
-\paragraph{Mode capture and Wasserstein.} Same definitions as v4. \textbf{Caveat for bounded chart}: mode capture computed in $q$-chart (physical joint space) for fair comparison with unbounded baseline.
-
-\paragraph{Numerical conditioning (diagnostic).}
-\begin{equation}
-\min_h \lambda_{\min}(G_Q^A(u_h, z_e)), \qquad \max_h \mathrm{cond}(G_Q^A(u_h, z_e)).
-\end{equation}
-Choice A guarantees $\lambda_{\min} \geq 1$, but useful to verify empirically.
-
-\section{Pipeline summary}
-
-\subsection{Framework pipeline (geometric core, bounded chart)}
-
-\begin{align}
-\text{Stage 1.}\quad & \Tphi = T_\text{analytic} \cdot \exp_{\SE(3)}(\xi_\phi^\wedge),\ \min_\phi \Loss_\text{self}\ \text{on } q \in [q_{\min}, q_{\max}] \\
-\text{Stage 2.}\quad & {\Mpose}^Q(z_e) = \{(q, T) : q \in (q_{\min}, q_{\max}), T = \Tphi(q, z_e)\},\ q = \psi(u) \\
-& G_Q^A = I_{n_q} + (\Jpose^Q)^\top W \Jpose^Q,\ \Jpose^Q = \Jpose D_\psi \\
-& G_Q^{A,\text{reg}} = G_Q^A + (c_\lambda \tr G_Q^A / n_q + \lambda_\text{floor}) I \\
-\text{Stage 3.}\quad & \tau_i = ({\Hpose}^Q(u_h^{(i)}, z_e))_{h=0}^H,\ u_h^{(i)} = \psi^{-1}(q_h^{(i)}) \\
-\text{Stage 4.}\quad & d\tau_r = \sqrt{\beta(r)}\, dB^{\Mset^{H+1}}_r \quad \text{(pure Brownian forward, no drift)} \\
-\text{Stage 5.}\quad & \min_\theta \Loss_\text{traj}^{\text{chart-}G},\ a^*_Q = (G_Q^A)^{-1}\bigl[(u_0 - u_r) + (\Jpose^Q)^\top W \Log_{\SE(3)}(\Tphi(\psi(u_r))^{-1} \Tphi(\psi(u_0)))\bigr] \\
-\text{Stage 6.}\quad & \tau_K \sim \prod_h \N(u^\text{init}, \tau_\text{brown}(K) (G_Q^A)^{-1}(u^\text{init})) \to \tau_0 \in ({\Mpose}^Q(z_e))^{H+1}.
-\end{align}
-
-\subsection{Application-specific extension}
-
-\begin{align}
-\text{Stage 5'.}\quad & c = (T_\text{start}, T_\text{target}, z_e),\ \text{channel-concat to score model with input } u_h \\
-\text{Stage 6'.}\quad & s_\text{guided}^u = s_\theta^u + (G_\text{traj}^{Q,A})^{-1} \nabla_{u_{0:H}} R_\text{total}(\tau, c) \quad \text{(autograd)} \\
-& R_\text{total} = \alpha_s R_\text{start} + \alpha_g R_\text{goal} + \alpha_v R_\text{vel} + \alpha_a R_\text{acc}.
-\end{align}
-
-\section{Feasibility and limitations}
-\label{sec:contribution-claim}
-
-\paragraph{Joint feasibility claim.} The bounded-chart formulation guarantees:
-\begin{equation}
-\boxed{ \forall h, k:\ q_{h, k} = \psi(u_{h, k}) \in (q_{\min}, q_{\max}). }
-\end{equation}
-This is a strict guarantee in the open interval, by construction of $\psi$. Combined with manifold adherence ($T_h = \Tphi(q_h, z_e)$, exact), the sampler produces trajectories that are simultaneously self-model consistent and joint-limit feasible.
-
-\paragraph{Open vs closed interval.} The boundary points $q = q_{\min}, q = q_{\max}$ are not reachable in finite-step sampling (require $u = \mp\infty$). For tasks where the demo trajectory touches the joint limit exactly (e.g., pushing a drawer to its mechanical stop), this is a representational limitation: the demo can be approximated arbitrarily closely but not reproduced exactly. For typical manipulation tasks (pick-and-place, reaching, obstacle avoidance), this limitation is irrelevant.
-
-\paragraph{Self-model validity domain.} The self-model $\Tphi(q, z_e)$ is trained on $q \in [q_{\min}, q_{\max}]$ (Stage 1 data). Sampled $q = \psi(u) \in (q_{\min}, q_{\max})$ stays within this validity domain. Outside this domain (e.g., $q > q_{\max}$), $\Tphi$ is not guaranteed accurate; bounded chart eliminates this concern.
-
-\paragraph{Trajectory quality.} Start adherence, smoothness, endpoint accuracy enforced at sampling time via product-manifold Riemannian guidance with $R_\text{total}$. Independent of forward SDE structure.
-
-\paragraph{Stationary distribution (unchanged from v4).} $u \in \R^{n_q}$ is non-compact, forward pure Brownian → no stationary probability measure. Finite-time noising on $r \in [0, K]$ retained. The bounded chart constrains \textbf{physical} $q$-support, not the \textbf{computational} $u$-support; this is acceptable since the sampler's output is judged on $q$ and $T$.
-
-\paragraph{Push-forward distortion (mandatory pre-flight).} The $u$-chart Gaussian reference distribution may concentrate mass near joint boundary in $q$-space if demo modes are boundary-adjacent. The distortion compounds in three stages (training warp $\to$ DSM target inflation $\to$ sampling asymmetry; see \S\ref{sec:reference-distribution}). \textbf{Decision rule}: compute the 1\%-tile and 5\%-tile of the demo relative-margin statistic; bounded chart is safe only when 1\%-tile $\geq 0.05$. Margin between $0.01$ and $0.05$ requires explicit empirical mode-capture comparison; below $0.01$ the bounded chart should not be deployed.
-
-\paragraph{Varadhan bias near chart boundary (structural).} The DSM chart-Euclidean displacement $u_0 - u_r$ is exact under uniform $G_Q^A$ but acquires a position-dependent systematic bias when $D_\psi$ varies across the trajectory range (see \S\ref{sec:dsm}). This bias cannot be eliminated under Choice A without sacrificing the global identity floor $G_Q^A \succeq I$; it is a structural trade-off of the bounded-chart formulation, not a numerical artifact. Empirical impact is bounded by the margin condition above; we report it as a known limitation and validate via $\|u\|_\infty$ percentiles and DSM loss-curve symmetry.
-
-\paragraph{Empirical re-validation required.} The "stationary issue is bypassed empirically" claim from v4 was validated on unbounded chart. Under bounded chart, the validation must be repeated, with additional diagnostics for the structural bias:
-\begin{itemize}[noitemsep]
-    \item \textbf{Pre-flight}: demo relative-margin 1\%-tile / 5\%-tile (decision rule, \S\ref{sec:reference-distribution}); abort if 1\%-tile $< 0.01$;
-    \item DSM loss convergence and \textbf{loss-curve symmetry across $\|u\|_\infty$ strata} (boundary-adjacent samples vs.\ center) --- asymmetry indicates Varadhan bias becoming load-bearing;
-    \item Pose success at standard $(\rho_p, \rho_R)$, reported per ID/OOD strata;
-    \item \textbf{Mode capture in $q$-chart} (push-forward-corrected): compare bounded vs.\ unbounded explicitly; mode-capture degradation $> 5$pp under matched margin condition is a failure signal;
-    \item OOD generalization on $z_e$;
-    \item $\|u\|_\infty$ distribution percentiles (saturation diagnostic): 99\%-tile $> 3$ indicates the chart is being driven into the saturation regime where $D_\psi$ vanishes;
-    \item $\min_h \lambda_{\min}(G_Q^A(u_h))$ and $\max_h \mathrm{cond}(G_Q^A(u_h))$ (numerical diagnostic, expected $\geq 1$ and bounded under Choice A);
-    \item Joint margin distribution percentiles (auxiliary): low margin with $\text{viol} = 0$ confirms chart-effective range is being exercised --- but not a failure signal by itself;
-    \item Smoothness $\text{vel}^q$ and $\text{vel}^u$ both reported, for cross-chart consistency check.
-\end{itemize}
-
-\paragraph{Core contribution (refined).} The contribution is the $z_e$-conditioned self-model manifold ${\Mpose}^Q(z_e)$ on $\SE(3)$ with bounded chart parameterization, induced task-aware metric $G_Q^A$ (Choice A), tangent-lifted score $J_H^{Q,A} s^u$, product-manifold Riemannian guidance, and joint-limit feasibility by construction. None of these depend on the choice of forward SDE structure (drift vs.\ pure Brownian). Pure Brownian remains the simplest forward consistent with these contributions.
-
-\appendix
-
-\section{Closed-form reward gradients (verified)}
-\label{app:closed-form-grad}
-
-Main implementation uses automatic differentiation. Closed forms for cross-verification.
-
-\subsection{Differential of $\Log_{\SE(3)}$}
-
-For $\xi \in \se(3)$, the $\SE(3)$ left Jacobian:
-\begin{equation}
-\mathcal{J}_l(\xi) = \begin{bmatrix} J_{l, \SO(3)}(\omega) & Q(\rho, \omega) \\ 0 & J_{l, \SO(3)}(\omega) \end{bmatrix}, \qquad \xi = (\rho, \omega).
-\end{equation}
-
-\subsection{Endpoint goal gradient (verified, $u$-chart form)}
-
-\textbf{Verified}: sign $= +$, Jacobian $= \mathcal{J}_l$. Relative error vs autograd: $9.67 \times 10^{-5}$ at $\|e_\text{goal}\|_\infty = 0.33$ rad on Franka 7-DoF (verified on $q$-chart; $u$-chart inherits via chain rule with $D_\psi$).
-
-For $e_\text{goal}(u_H) = \Log_{\SE(3)}(\Tphi(\psi(u_H), z_e)^{-1} T_\text{target})$:
-\begin{equation}
-\boxed{ \nabla_{u_H} R_\text{goal} = +2\, \Jpose^Q(u_H, z_e)^\top \mathcal{J}_l^{-\top}(e_\text{goal})\, W_g\, e_\text{goal}, }
-\end{equation}
-where $\Jpose^Q = \Jpose D_\psi$.
-
-\paragraph{Derivation sketch.} Body-frame perturbation $u_H \to u_H + \delta u$ induces $q_H \to q_H + D_\psi \delta u$, which right-multiplies $\Tphi$ by $\exp(\Jpose D_\psi \delta u)^\wedge = \exp(\Jpose^Q \delta u)^\wedge$. Same chain as v4 with $\Jpose \to \Jpose^Q$.
-
-\subsection{Decoupled position/rotation form}
-
-For decoupled reward in $u$-chart:
-\begin{equation}
-\nabla_{u_H} R_\text{goal}^\text{(pos)} = -2 \alpha_p\, (J_p^\text{world} D_\psi)^\top (p_\phi(\psi(u_H), z_e) - p_\text{target}),
-\end{equation}
-\begin{equation}
-\nabla_{u_H} R_\text{goal}^\text{(rot)} = +2 \alpha_R\, (J_\omega D_\psi)^\top J_{l, \SO(3)}^{-\top}(e_\omega^g)\, e_\omega^g.
-\end{equation}
-
-\section{Choice B (alternative formulation, not default)}
-\label{app:choice-b}
-
-Choice B uses the physical $q = \psi(u)$ as the ambient first component. We document it for completeness.
-
-\paragraph{Tangent map.}
-\begin{equation}
-J_H^{Q,B}(u, z_e) = \begin{bmatrix} D_\psi(u) \\ \Jpose(\psi(u), z_e)\, D_\psi(u) \end{bmatrix} = D_\psi(u) \cdot \begin{bmatrix} I_{n_q} \\ \Jpose(\psi(u), z_e) \end{bmatrix} \cdot \text{(formal — } D_\psi \text{ acts on column)}.
-\end{equation}
-More precisely, for $\dot u \in \R^{n_q}$: $J_H^{Q,B} \dot u = (D_\psi \dot u, \Jpose D_\psi \dot u) = (D_\psi \dot u, \Jpose^Q \dot u)$.
-
-\paragraph{Metric.}
-\begin{equation}
-G_Q^B(u, z_e) = D_\psi^\top \bigl[I_{n_q} + \Jpose^\top W \Jpose\bigr] D_\psi = D_\psi^\top G_\text{pose}(\psi(u), z_e) D_\psi.
-\end{equation}
-
-\paragraph{Why not default.} Boundary degeneracy: $D_\psi \to 0$ implies $G_Q^B \to 0$ (entire matrix vanishes), giving $(G_Q^B)^{-1} \to \infty$. Tikhonov floor $\lambda_\text{floor}$ becomes essential and load-bearing. Floor too small: numerical instability. Floor too large: $G_Q^B + \lambda_\text{floor} I \approx \lambda_\text{floor} I$ near boundary, decoupling geometry from $D_\psi$ — equivalent to chart-Euclidean noise in saturated region, which alters mode dynamics.
-
-In contrast, Choice A's $G_Q^A = I + (\Jpose^Q)^\top W \Jpose^Q$ has identity floor structurally, so degeneracy of $\Jpose^Q$ degrades $G_Q^A$ smoothly toward $I$ rather than toward $0$. Choice A is therefore the safer default.
-
-\paragraph{When Choice B might be preferred.} If a downstream application requires the chart Euclidean inner product $\dot q^\top \dot q$ (rather than $\dot u^\top \dot u$) as the unweighted ambient component — e.g., for a specific physical interpretation of "isotropic noise in joint space" — Choice B realizes this. Position-only literature with $G = I + J_F^\top J_F$ implicitly uses this convention. We do not recommend it for joint-limit bounded chart due to the degeneracy issue.
-
-\section{Summary of v4 $\to$ v4.1 changes}
+\paragraph{Corrected reference table.}
 
 \begin{center}
-\begin{tabular}{l|p{4.5cm}|p{4.5cm}}
-\textbf{Aspect} & \textbf{v4} & \textbf{v4.1 (this document)} \\
+\begin{tabular}{r|r|r|l}
+$\beta_f$ & $\tau(K)$ & $\alpha(K) = e^{-\tau(K)/2}$ & interpretation \\
 \hline
-Chart coordinate & $q \in \R^{n_q}$ (unbounded) & $u \in \R^{n_q}$ with $q = \psi(u) \in (q_{\min}, q_{\max})$ \\
-\hline
-Manifold & $\Mpose(z_e) = \{(q, T) : T = \Tphi(q, z_e)\}$ & ${\Mpose}^Q(z_e) = \{(q, T) : q \in (q_{\min}, q_{\max}), T = \Tphi(q, z_e)\}$ \\
-\hline
-Geometric Jacobian & $\Jpose \in \R^{6 \times n_q}$ & $\Jpose^Q = \Jpose D_\psi \in \R^{6 \times n_q}$ \\
-\hline
-Tangent map (default) & $J_H^\text{pose} = [I; \Jpose]^\top$ & $J_H^{Q,A} = [I; \Jpose^Q]^\top$ (Choice A) \\
-\hline
-Metric (default) & $G_\text{pose} = I + \Jpose^\top W \Jpose$ & $G_Q^A = I + (\Jpose^Q)^\top W \Jpose^Q$ \\
-\hline
-Lower bound & $G_\text{pose} \succeq I$ (via identity) & $G_Q^A \succeq I$ (preserved via Choice A; would fail under Choice B) \\
-\hline
-Tikhonov & Adaptive: $\lambda = c_\lambda \tr(G)/n_q$ & Adaptive + floor: $\lambda_Q = c_\lambda \tr(G_Q^A)/n_q + \lambda_\text{floor}$ \\
-\hline
-DSM target & $a^*_\text{pose} = G_\text{pose}^{-1}[(q_0 - q_r) + \Jpose^\top W \Log_{SE(3)}(\cdot)]$ & $a^*_Q = (G_Q^A)^{-1}[(u_0 - u_r) + (\Jpose^Q)^\top W \Log_{SE(3)}(\cdot)]$ \\
-\hline
-Reference distribution & $\N(q^\text{init}, \tau_\text{brown}(K) G_\text{pose}^{-1})$ & $\N(u^\text{init}, \tau_\text{brown}(K) (G_Q^A)^{-1})$ with push-forward warning \\
-\hline
-IK seed & $q^\text{init} = \IK(\cdot)$ direct & $u^\text{init} = \tanh^{-1}(\mathrm{clip}(\eta, -1+\epsilon, 1-\epsilon))$, init-only safety \\
-\hline
-Sampling clipping & N/A & \textbf{None during sampling}; bounded chart auto-enforces $q \in (q_{\min}, q_{\max})$ \\
-\hline
-Joint feasibility & Soft (via demo distribution + bounded $K$); reported as evaluation metric & Strict in open interval $(q_{\min}, q_{\max})$, by construction \\
-\hline
-Self-model domain & Implicit & Explicit Stage 1 assumption: trained on $q \in [q_{\min}, q_{\max}]$ \\
-\hline
-Smoothness reward & $\| q_{h+1} - q_h \|^2$ in $q$-chart & $\| \psi(u_{h+1}) - \psi(u_h) \|^2$ in $q$-chart (default, baseline parity); $\| u_{h+1} - u_h \|^2$ alternative (chart-Euclidean) \\
-\hline
-Stationary distribution & None ($q \in \R^{n_q}$ non-compact) & None ($u \in \R^{n_q}$ non-compact) — \textbf{unchanged}; physical $q$-support is bounded but computational chart is not \\
-\hline
-Empirical re-validation & N/A & Required: DSM convergence, succ, mode capture, OOD, $\|u\|_\infty$, $\mathrm{cond}(G_Q^A)$ \\
-\hline
-Forward SDE & $dX_r = \sqrt{\beta(r)} dB^\Mset_r$ (drift-free) & Same (drift-free preserved) \\
-\hline
-Reverse step & Score + guidance only (no $-b^q$) & Same \\
-\hline
-Quaternion conventions & Hemisphere consistency, $(q, \bar q_R, p, z_e)$ storage & Same, with storage form $(u, q, \bar q_R, p, z_e)$ \\
-\hline
-Reward gradient & Closed forms in Appendix (verified $+\mathcal{J}_l$) & Same with $\Jpose \to \Jpose^Q$ in $u$-chart form \\
+4 & $\approx 2.00$ & $\approx 0.368$ & terminal mismatch large \\
+10 & $\approx 5.00$ & $\approx 0.082$ & substantial reduction \\
+20 & $\approx 10.00$ & $\approx 0.0067$ & effectively stationary \\
 \end{tabular}
 \end{center}
 
-\paragraph{Backward compatibility.} Setting $\psi(u) = u$ (identity diffeomorphism, $D_\psi = I$, $q_{\text{range}} \to \infty$) recovers v4 exactly: $\Jpose^Q \to \Jpose$, $G_Q^A \to G_\text{pose}$, $u^\text{init} \to q^\text{init}$, and all other quantities reduce to v4 forms. v4.1 is therefore a strict generalization.
+\paragraph{Important distinction.} ``OU stationary exists exactly'' is a \emph{structural} property — distinct from the finite-$K$ marginal-reference match. The former is exact at all $\beta_f$ (it is a property of the SDE, independent of how long we run it). The latter improves as $\beta_f$ increases. The IK-free claim rests on the structural property: there is a well-defined task-agnostic distribution to start the reverse SDE from. Whether that distribution exactly matches the forward marginal $p_K$ depends on the empirical $\KL(p_K \| p_\text{ref})$ at the chosen $\beta_f$.
 
-\paragraph{Choice B fallback.} If empirical results indicate Choice A's $u$-chart smoothness is unsatisfactory for a specific task, Choice B (Appendix~\ref{app:choice-b}) is available with appropriate Tikhonov floor calibration.
+\section{Score conventions (fixed)}
+\label{sec:score-conventions}
+
+\paragraph{Network output: Euclidean score.}
+\begin{equation}
+\boxed{ s_\theta^u(r, x, c, z_e) \approx \nabla_u \log p_r(u \mid c, z_e). }
+\end{equation}
+This is the Euclidean coordinate gradient of $\log p_r$, not the Riemannian gradient. The choice is consistent with Score-SDE (Song et al., 2021) convention.
+
+\paragraph{Network input.}
+\begin{equation}
+\text{input}_h = [u_h, r, h/H, z_e, T_\text{start}, T_\text{target}].
+\end{equation}
+No anchor, no $q^\text{init}$, no IK-derived variable. The conditioning information $(z_e, T_\text{start}, T_\text{target})$ enters here.
+
+\paragraph{Multimodality.} Captured by the score network alone, conditional on $c$. The v4 mode-aware IK warm-start is removed.
+
+\section{Score matching loss}
+\label{sec:loss}
+
+\paragraph{Chart-block target (exact Euclidean OU score).}
+\begin{equation}
+\boxed{ s^{u, *}(u_r, u_0; r) = -\frac{\GQbar\, (u_r - \alpha(r)\, u_0)}{\sigma^2(r)}. }
+\end{equation}
+Note: \emph{no} $\GQ^{-1}$ factor (v5 error corrected). This is exactly $\nabla_{u_r} \log p_{r \mid 0}(u_r \mid u_0)$ for the closed-form OU transition.
+
+\paragraph{Primary loss: closed-form OU score matching.}
+\begin{equation}
+\boxed{ \Loss_\text{score} = \E_{r, \tau_0, \tau_r}\!\left[\, w(r) \sum_h \bigl\| s_{\theta, h}^u - s^{u, *}_h(u_{h, r}, u_{h, 0}; r) \bigr\|_{M(u_{h, r}, z_e)}^2 \,\right]. }
+\end{equation}
+where $M$ is a weighting matrix. Choices for ablation:
+\begin{itemize}[noitemsep]
+    \item $M = I_{n_q}$: standard Euclidean.
+    \item $M = \GQ^{-1}$: down-weights metric-anisotropic directions.
+    \item $M = \GQ$: up-weights metric-anisotropic directions.
+\end{itemize}
+\textbf{The target $s^{u, *}$ does not change across these choices; only the weighting metric of the residual.} Default: $M = I_{n_q}$, with $w(r) = \sigma^2(r)^2$ (SNR-aware).
+
+\paragraph{Auxiliary pose-geometric consistency regularizer (optional).} The pose component $T = \widetilde T_\phi(u, z_e)$ is a deterministic function of $u$; therefore the $u$-space OU does \emph{not} induce a closed-form Gaussian distribution on $T$, and the $\Log_{\SE(3)}$ term is not an exact transition score. We retain it as a Varadhan-style consistency regularizer:
+\begin{equation}
+\Loss_\text{pose} = \E_{r, \tau_0, \tau_r}\!\left[\, \lambda_p(r) \sum_h \Bigl\| \JQ(u_{h, r}, z_e)\, s_{\theta, h}^u - \tfrac{1}{\tau(r)} \Log_{\SE(3)}\!\bigl(\widetilde T_\phi(u_{h, r})^{-1} \widetilde T_\phi(u_{h, 0})\bigr) \Bigr\|_W^2 \,\right].
+\end{equation}
+This term enforces that the lifted score $\JQ s_\theta^u$ aligns with the pose-tangent displacement implied by demos. It is an auxiliary geometric prior, not an exact DSM target.
+
+\paragraph{Total loss.}
+\begin{equation}
+\Loss = \Loss_\text{score} + \mu_\text{pose}\, \Loss_\text{pose}, \quad \mu_\text{pose} \in [0, 1].
+\end{equation}
+$\mu_\text{pose} = 0$ gives clean ``exact closed-form OU score matching'' baseline; $\mu_\text{pose} > 0$ adds pose consistency. \textbf{Ablate.}
+
+\paragraph{Validity regime of $\Loss_\text{pose}$.} The Varadhan-style pose term is accurate for small $r$ (small $u_0$-$u_r$ displacement) and degrades at large $r$. The $\lambda_p(r)$ schedule should down-weight large-$r$ contributions; default $\lambda_p(r) = \mathbb{1}[\tau(r) < \tau_\text{cutoff}]$ with $\tau_\text{cutoff} \approx 0.5$.
+
+\section{Sampling}
+\label{sec:sampling}
+
+\paragraph{Sampler positioning.} Chart-space OU sampler with graph retraction. \textbf{Not} an intrinsic Riemannian Brownian motion (the term ``geodesic random walk'' from v5 is dropped). Graph retraction onto $\Mbpose$ ensures learned-manifold consistency (see \S\ref{sec:feasibility-tiers} for what this means and does not mean).
+
+\paragraph{Graph retraction.}
+\begin{equation}
+\Retr_{(u, T)}(\delta u) = \bigl(u + \delta u,\, \widetilde T_\phi(u + \delta u, z_e)\bigr).
+\end{equation}
+
+\subsection{Reference distribution}
+\label{sec:reference-distribution}
+
+\begin{equation}
+\boxed{ p_\text{ref}(\tau) = \prod_{h=0}^H \N(u_h;\, 0,\, \GQbar^{-1}) = \prod_h p_\infty. }
+\end{equation}
+
+\paragraph{Justification.} $p_\text{ref} = p_\infty$ by definition. At finite $K$, $p_K \neq p_\text{ref}$ exactly; the gap is measured by $\KL(p_K \| p_\text{ref})$ or $W_2$. The IK-free claim rests on $p_\text{ref}$ being data-independent and conditioning-independent at sampling time — not on $p_K = p_\text{ref}$ at the chosen $\beta_f$. The latter is an empirical question, addressed by the $\beta_f$ sweep (\S\ref{sec:beta-schedule}).
+
+\paragraph{Sampling-time independence audit.}
+\begin{itemize}[noitemsep]
+    \item Does $p_\text{ref}$ depend on $z_e$? \textbf{No} (when $\GQbar = I_{n_q}$; depends on $\bar z_e$ but not sample-time $z_e$ for $\GQbar = \GQ(0, \bar z_e)$).
+    \item Does $p_\text{ref}$ depend on $T_\text{start}, T_\text{target}$? \textbf{No.}
+    \item Does $p_\text{ref}$ require an IK solver call? \textbf{No.}
+    \item Does $p_\text{ref}$ require $q_\text{warm}$ or mode-aware seeding? \textbf{No.}
+\end{itemize}
+
+\subsection{Reverse SDE (Convention 1: forward time \texorpdfstring{$r$}{r}, \texorpdfstring{$\Delta r < 0$}{Delta r < 0})}
+\label{sec:reverse-sde}
+
+\paragraph{Forward SDE in standard form.}
+\begin{equation}
+du_r = f(u_r, r)\, dr + g(r)\, L\, dW_r, \quad f(u, r) = -\tfrac{1}{2}\beta(r)\, u, \quad g(r) = \sqrt{\beta(r)}, \quad L = \GQbar^{-1/2}.
+\end{equation}
+$LL^\top = \GQbar^{-1}$.
+
+\paragraph{Anderson(1982) reverse SDE in forward time $r$.}
+\begin{equation}
+\boxed{ du_r = \bigl[f(u_r, r) - g^2(r)\, LL^\top\, \nabla_{u_r} \log p_r(u_r)\bigr]\, dr + g(r)\, L\, d\bar W_r, \quad dr < 0. }
+\end{equation}
+
+Substituting:
+\begin{equation}
+du_r = \bigl[-\tfrac{1}{2}\beta(r)\, u_r - \beta(r)\, \GQbar^{-1}\, s_\theta^u(u_r, r, c, z_e)\bigr]\, dr + \sqrt{\beta(r)}\, \GQbar^{-1/2}\, d\bar W_r, \quad dr < 0.
+\end{equation}
+
+\paragraph{Discrete update (Euler-Maruyama, Convention 1).}
+\begin{equation}
+\boxed{ u_{k+1} = u_k + \bigl[-\tfrac{1}{2}\beta(r_k)\, u_k - \beta(r_k)\, \GQbar^{-1}\, s_\theta^u(u_k, r_k, c, z_e)\bigr]\, \Delta r + \sqrt{\beta(r_k) |\Delta r|}\, \GQbar^{-1/2}\, \xi_k, }
+\end{equation}
+where $\Delta r < 0$, $\xi_k \sim \N(0, I_{n_q})$, $r_{k+1} = r_k + \Delta r < r_k$. The integration starts at $r_0 = K$ with $u_0 \sim p_\text{ref}$ and proceeds toward $r \to 0$.
+
+\paragraph{Sign verification.} At each step, $-\tfrac{1}{2}\beta u\, \Delta r$ with $\Delta r < 0$ gives a positive contribution along $+u$ direction: this is the reverse-direction OU mirror (pushing $u$ away from origin, mirroring the forward attraction). The score term $-\beta \GQbar^{-1} s_\theta^u \cdot \Delta r$ with $\Delta r < 0$ gives a positive contribution along $+\nabla \log p$ direction: this points toward higher-density regions, as required. Signs are consistent.
+
+\subsection{Reverse step with multi-component guidance}
+\label{sec:sampling-step}
+
+Adding guidance as preconditioned additive correction to the score:
+\begin{equation}
+\mu_k^u = -\tfrac{1}{2} u_k - \GQbar^{-1}\, \bigl[s_\theta^u(u_k, r_k, c, z_e) + m_k \cdot \GQ(u_k, z_e)^{-1}\, \nabla_u R_\text{total}(\tau_k, c)\bigr]
+\end{equation}
+\begin{equation}
+\delta u_k = \beta(r_k)\, \mu_k^u\, \Delta r + \sqrt{\beta(r_k) |\Delta r|}\, \GQbar^{-1/2}\, \xi_k
+\end{equation}
+\begin{equation}
+u_{k+1} = u_k + \delta u_k, \quad x_{k+1} = \Hbpose(u_{k+1}, z_e).
+\end{equation}
+
+\paragraph{Status of $\GQ^{-1}$ in guidance.} The factor $\GQ^{-1}$ in front of $\nabla R$ is a natural-gradient-style preconditioning — it scales the reward gradient by the inverse induced metric. \textbf{This is a heuristic, not from the exact reverse SDE.} It is a deliberate design choice that respects the manifold geometry; alternative choices ($M = I$, $M = \GQbar^{-1}$) are valid for ablation. The score correction term $-\GQbar^{-1} s_\theta^u$ does come from the exact reverse SDE.
+
+\paragraph{Three roles, three terms.}
+\begin{enumerate}[noitemsep]
+    \item Reverse OU mirror $-\tfrac{1}{2} u_k$: data-independent, defines the diffusion process.
+    \item Score correction $-\GQbar^{-1} s_\theta^u$: data-conditional, reconstructs $p_\text{data}$.
+    \item Guidance $-\GQbar^{-1} \GQ^{-1} \nabla R$: task-specific, injects $T_\text{start}, T_\text{target}$ via reward.
+\end{enumerate}
+
+\section{Multi-component guidance}
+\label{sec:guidance}
+
+\paragraph{Status as conditioning channel.} The score network conditioning $(T_\text{start}, T_\text{target}, z_e)$ is the \emph{primary} channel by which task information enters sampling. Reward guidance is an \emph{additional, non-IK, non-network explicit mechanism}. It is not the sole channel.
+
+\paragraph{Trajectory-level guided update.}
+\begin{equation}
+s_\text{guided}^u = s_\theta^u + G_\text{traj}^{-1}\, \nabla_{u_{0:H}} R_\text{total}(\tau, c),
+\end{equation}
+where $G_\text{traj} = \mathrm{diag}(\GQ(u_h, z_e))$. As noted, $G_\text{traj}^{-1}$ preconditioning is heuristic.
+
+\paragraph{Reward.}
+\begin{equation}
+R_\text{total} = \alpha_s R_\text{start} + \alpha_g R_\text{goal} + \alpha_v R_\text{vel} + \alpha_a R_\text{acc}.
+\end{equation}
+
+\paragraph{Pose start anchor.}
+\begin{equation}
+e_\text{start}(u_0, z_e) = \Log_{\SE(3)}\bigl(\widetilde T_\phi(u_0, z_e)^{-1} T_\text{start}\bigr), \quad R_\text{start} = -(\alpha_p^s \|e_\rho^s\|^2 + \alpha_R^s \|e_\omega^s\|^2).
+\end{equation}
+Recommended: $\alpha_s \geq 2 \alpha_g$ (start anchor compensating for absence of IK warm-start).
+
+\paragraph{Goal, velocity, acceleration.} As in v4/v5.
+
+\paragraph{Mask schedules.} $m_h^s = \mathbb{1}[h \leq H/4]$, $m_h^g = \mathbb{1}[h \geq 3H/4]$, $m_h^v = m_h^a = 1$.
+
+\section{Feasibility claims, tiered}
+\label{sec:feasibility-tiers}
+
+\paragraph{Tier 1: Joint feasibility — exact by construction.}
+\begin{equation}
+\psi(u) \in (q_\text{min}, q_\text{max}) \quad \forall u \in \R^{n_q}.
+\end{equation}
+This holds for any sample, any training distribution, any extrapolation. Structurally guaranteed by the chart map.
+
+\paragraph{Tier 2: Learned-manifold adherence — exact w.r.t.\ $\Tphi$.}
+\begin{equation}
+\|g_\phi(x, z_e)\|_W = \|\Log_{\SE(3)}(\Tphi(\psi(u), z_e)^{-1} T)\|_W = 0
+\end{equation}
+holds for samples produced by $\Hbpose$ retraction. This says $T$ is consistent with $\Tphi$ at $q = \psi(u)$. It does \emph{not} say $T$ matches the true robot pose.
+
+\paragraph{Tier 3: True physical feasibility — depends on self-model accuracy.} The true robot end-effector at configuration $q$ has pose $T_\text{true}(q, z_e)$, which may differ from $\Tphi(q, z_e)$ by the self-model approximation error. Stage-1 trained $\xi_\phi$ residual on Franka achieves $0.003$ m / $0.002$ rad inside-training and $0.004$ m / $0.003$ rad outside-1$\times$ (REPORT \S3). Tier 3 feasibility is bounded by these errors, plus dynamics/torque/collision considerations not modeled here.
+
+\paragraph{What v5.1 does and does not guarantee.}
+\begin{itemize}[noitemsep]
+    \item Guarantees joint limit satisfaction (Tier 1).
+    \item Guarantees consistency with learned self-model (Tier 2).
+    \item Does \emph{not} guarantee collision-free trajectories.
+    \item Does \emph{not} guarantee dynamic feasibility (torque, velocity, acceleration limits beyond the soft chart-smoothness reward).
+    \item Does \emph{not} guarantee that $T$ matches the true robot pose (bounded by Stage-1 self-model error).
+\end{itemize}
+
+\section{Evaluation metrics}
+\label{sec:eval}
+
+Standard metrics from v4/v5: $e_p, e_R, \text{succ}@(\rho_p, \rho_R)$, mode capture, smoothness.
+
+\paragraph{Required new metrics for v5.1.}
+\begin{itemize}[noitemsep]
+    \item \textbf{Reference-marginal match.} $\KL(p_K \| p_\text{ref})$ or $W_2(\text{empirical}(u_K), \N(0, \GQbar^{-1}))$. This validates the IK-free reference choice for the chosen $\beta_f$. Required because the structural exactness of $p_\infty$ does not imply finite-$K$ exactness of $p_K$.
+    \item \textbf{Joint limit violation rate.} Should be exactly $0$ (Tier 1 verification, sanity check).
+    \item \textbf{Chart saturation $\|u\|_\infty^{p99}$.} Healthy: $\lesssim 2$. Saturation: $> 3$.
+    \item \textbf{Tier 3 self-model error proxy.} Difference between $\widetilde T_\phi(u_H, z_e)$ and a high-fidelity reference pose, when available; otherwise reported as ``not measured.''
+\end{itemize}
+
+\section{Pipeline summary}
+
+\begin{align}
+\text{Stage 1.}\quad & \Tphi = T_\text{analytic} \cdot \exp_{\SE(3)}(\xi_\phi^\wedge) \\
+\text{Stage 2.}\quad & \Mbpose(z_e), \quad \GQ = I + {\JQ}^\top W \JQ, \quad \GQbar = I_{n_q} \\
+\text{Stage 3.}\quad & u_h^{(i)} = \psi^{-1}(q_h^{(i)}) \text{ (demo projection)} \\
+\text{Stage 4.}\quad & du_r = -\tfrac{1}{2}\beta\, u_r\, dr + \sqrt{\beta}\, \GQbar^{-1/2}\, dW_r \\
+\text{Stage 5.}\quad & p_{r \mid 0} = \N(\alpha(r) u_0, \sigma^2(r) \GQbar^{-1}) \text{ (closed-form)} \\
+\text{Stage 6.}\quad & \min_\theta \Loss_\text{score} + \mu_\text{pose} \Loss_\text{pose} \\
+\text{Stage 7.}\quad & u^{(K)} \sim \N(0, \GQbar^{-1}) \text{ (IK-free)} \\
+\text{Stage 8.}\quad & \text{Reverse SDE Convention 1: } \Delta r < 0, \text{ with score + guidance} \\
+\text{Stage 9.}\quad & q_h = \psi(u_h^{(0)}), \quad T_h = \Tphi(q_h, z_e)
+\end{align}
+
+\section{Limitations}
+
+\paragraph{Score-net capacity demand.} IK seed removal places multimodality and trajectory shape on score net alone. Higher capacity / more training steps expected vs.\ v4.
+
+\paragraph{Pose-block term is auxiliary, not exact.} Honest framing: $\Loss_\text{pose}$ is a Varadhan-style consistency regularizer, not an exact DSM target. $\mu_\text{pose}$ should be tuned by ablation.
+
+\paragraph{$\GQbar$ choice impacts forward-reference match.} Different $\GQbar$ choices alter how closely $p_K$ approaches $p_\text{ref}$ for given $\beta_f$. The IK-free claim is robust to $\GQbar$ choice (always data-independent at sampling), but pose-accuracy performance is not.
+
+\paragraph{Saturation.} Chart $|u| > 3$ ill-conditioned. If observed, add $-\alpha_u \|u\|^2$ to $R_\text{total}$.
+
+\paragraph{Interior pose accuracy expected below v4.} ABL3 in v4 showed IK seed contributed $\sim 75$ pp pose accuracy on interior demos. v5.1 cannot recover this from architectural change alone; expected boundary-active comparable or better, interior worse.
+
+\paragraph{Tier 3 not addressed.} Collision, torque, dynamics outside framework scope.
+
+\section{Summary of v5.1 changes (relative to v5)}
+
+\begin{center}
+\begin{tabular}{l|p{4.0cm}|p{5.5cm}}
+\textbf{Issue (v5 review)} & \textbf{v5} & \textbf{v5.1 (this document)} \\
+\hline
+Finite-$K$ exact match & ``Exact'' claimed & Structural stationary exact; finite-$K$ $p_K \neq p_\text{ref}$, measured empirically \\
+\hline
+$\beta_f$-$\alpha$ table & $\beta_f = 10 \Rightarrow \alpha \approx 0.007$ (error) & $\beta_f = 10 \Rightarrow \alpha \approx 0.082$; $\beta_f = 20 \Rightarrow \alpha \approx 0.007$ \\
+\hline
+Score convention & Mixed (Euclidean vs.\ Riemannian) & Fixed to Euclidean: $s_\theta^u = \nabla_u \log p_r$ \\
+\hline
+DSM target & $-\GQ^{-1} \GQbar (u_r - \alpha u_0)/\sigma^2$ & $-\GQbar (u_r - \alpha u_0)/\sigma^2$ (no $\GQ^{-1}$) \\
+\hline
+Reverse SDE sign & Mixed conventions & Convention 1: forward time $r$, $\Delta r < 0$ \\
+\hline
+Sampler name & ``Geodesic random walk'' & ``Chart-space OU sampler with graph retraction'' \\
+\hline
+Pose-block term & ``Hybrid DSM target'' & ``Auxiliary pose-geometric consistency regularizer'' \\
+\hline
+Conditioning channel & ``Sole channel'' & ``Non-IK, non-network explicit channel'' (network is primary) \\
+\hline
+Feasibility claim & ``By construction'' (flat) & Tier 1 joint / Tier 2 learned-manifold / Tier 3 true physics \\
+\hline
+``Riemannian SDE'' claim & Implied throughout & Made precise: chart-space OU, not Riemannian Brownian \\
+\hline
+Reference-marginal eval & Optional & Required ($\KL$ or $W_2$) \\
+\end{tabular}
+\end{center}
+
+\paragraph{What v5.1 keeps from v5.}
+\begin{itemize}[noitemsep]
+    \item Bounded chart with joint feasibility by construction.
+    \item OU forward with closed-form Gaussian transition (now properly named ``chart-space OU,'' not Riemannian).
+    \item Closed-form stationary $\N(0, \GQbar^{-1})$ enabling IK-free reference.
+    \item Closed-form Euclidean OU score as the exact training target (chart block).
+    \item Self-model graph manifold $\Mbpose$ via retraction.
+    \item Multi-component reward guidance.
+\end{itemize}
+
+\paragraph{What v5.1 abandons from v5.}
+\begin{itemize}[noitemsep]
+    \item ``Exact match'' claim at finite $K$.
+    \item Mixed score conventions.
+    \item ``Geodesic random walk'' terminology.
+    \item ``Hybrid DSM'' framing of the pose term.
+    \item ``Sole conditioning channel'' framing of guidance.
+    \item ``Riemannian diffusion'' overclaim.
+\end{itemize}
+
+\appendix
+
+\section{Closed-form reward gradients on bounded chart}
+
+\begin{equation}
+\nabla_{u_H} R_\text{goal} = +2\, \JQ(u_H, z_e)^\top\, \mathcal{J}_l^{-\top}(e_\text{goal})\, W_g\, e_\text{goal}(u_H, z_e).
+\end{equation}
+$\JQ = \Jpose \Dpsi$ absorbs the chart chain rule. Implementation via autograd.
+
+\section{Comparison to v4 reverse SDE}
+
+v4: $dY = \beta s_\theta^q\, dr + \sqrt{\beta}\, \sigma\, d\bar W$, $\Delta r < 0$, no OU mirror, $\sigma\sigma^\top = G_\text{pose}^{-1}$.
+
+v5.1: $du = [-\tfrac{1}{2}\beta u - \beta \GQbar^{-1} s_\theta^u]\, dr + \sqrt{\beta}\, \GQbar^{-1/2}\, d\bar W$, $\Delta r < 0$.
+
+Structural addition in v5.1: OU mirror $-\tfrac{1}{2}\beta u$. This is the term that confines reverse sampling to the stationary even when score is uninformative. v4 had no such confinement; it relied on score net + IK seed.
+
+\section{Why Convention 1}
+
+Convention 1 ($r$ as forward time, $\Delta r < 0$ on reverse) and Convention 2 ($\bar r = K - r$, $\Delta \bar r > 0$) are equivalent by variable substitution. Convention 1 is selected because:
+\begin{itemize}[noitemsep]
+    \item Standard Score-SDE (Song et al., 2021) and most diffusion model implementations use it.
+    \item It avoids confusion about which direction the SDE is integrated when reading the equation: $dr < 0$ is explicit.
+    \item Discrete update formulas align with DDPM-style $t = T, T-1, \ldots, 1$ indexing.
+\end{itemize}
+
+\section{Future work}
+
+\paragraph{Pose-space exact transition.} Lie-OU on $\SE(3)$ to remove the Varadhan approximation in $\Loss_\text{pose}$.
+
+\paragraph{Anisotropic $\GQbar$.} Ablate $\GQbar \in \{I, \GQ(0, \bar z_e), \E[\GQ]\}$.
+
+\paragraph{Comparison vs.\ v5-option-X.} Same demo, same eval, both trained from scratch. Does exact OU consistency translate to measurable improvement over Brownian + large horizon?
+
+\paragraph{Learned reference.} $g_\psi(c, z_e) \to (\mu_\text{ref}, \Sigma_\text{ref})$ as soft trainable IK replacement.
+
+\paragraph{Physically-grounded $W$.} Inherited from v4.
 
 \end{document}

@@ -63,6 +63,18 @@ def parse_args():
     p.add_argument("--branch-p-A", type=float, default=0.5)
     p.add_argument("--jitter-q", type=float, default=0.05)
     p.add_argument("--n-ik-steps", type=int, default=10)
+    p.add_argument("--ik-alpha", type=float, default=0.5,
+                   help="DLS IK main step size (Tier 0 default 0.5).")
+    p.add_argument("--ik-alpha-null", type=float, default=0.3,
+                   help="DLS IK null-space rest bias (Tier 2 v5 uses 0.25).")
+    p.add_argument("--ik-lam", type=float, default=0.05,
+                   help="DLS IK damping (Tikhonov) factor.")
+    p.add_argument("--ik-clamp-to-limits", action="store_true",
+                   help="Clamp post-step q to (q_min+δ, q_max-δ) at each IK "
+                        "iteration. Tier 1/2 boundary-active demo gen requires "
+                        "this for strict feasibility (Experiment_plan.md §2.2).")
+    p.add_argument("--ik-clamp-margin-frac", type=float, default=0.001,
+                   help="δ/q_range for IK clamp; 0.001 means 0.1%% of joint range.")
     p.add_argument("--target-perturb-deg", type=float, default=30.0,
                    help="Target rotation perturbation: each axis-angle component "
                          "~ Uniform[-deg, +deg].")
@@ -151,6 +163,11 @@ def parse_args():
                         "under Choice A (G_Q^A >= I globally) but retained for "
                         "arithmetic underflow safety.  Active only when "
                         "--bounded-chart is set.")
+    p.add_argument("--demo-pool-size", type=int, default=0,
+                   help="If > 0, pre-generate this many demos once at startup and "
+                        "sample minibatches from the cached pool during training. "
+                        "Avoids per-step online IK (n_ik_steps=25 makes the "
+                        "Tier 2 pipeline ~3 sec/step otherwise).  Recommended: 8192.")
     p.add_argument("--cond-injection", type=str, default="channel",
                    choices=["global", "channel"])
     p.add_argument("--endpoint-weight", type=float, default=1.0)
@@ -258,8 +275,11 @@ def main():
         z_e_range=(args.z_min, args.z_max),
         branch_p_A=args.branch_p_A, jitter_q=args.jitter_q,
         n_ik_steps=args.n_ik_steps,
+        ik_alpha=args.ik_alpha, ik_alpha_null=args.ik_alpha_null, ik_lam=args.ik_lam,
         R_anchor_axis_angle=args.R_anchor_aa,
         target_perturb_rad=target_perturb_rad,
+        ik_clamp_to_limits=args.ik_clamp_to_limits,
+        ik_clamp_margin_frac=args.ik_clamp_margin_frac,
     )
 
     # --- SDE + score net ---
@@ -307,11 +327,30 @@ def main():
         optim.load_state_dict(ckpt["optim"])
         print(f"[resume] loaded {args.resume_from}")
 
+    # --- optional demo pool (v4.1: avoids online IK each step) ---
+    pool = None
+    if args.demo_pool_size > 0:
+        n_pool = int(args.demo_pool_size)
+        print(f"[demo-pool] pre-generating {n_pool} trajectories once...")
+        with torch.no_grad():
+            x_p, A_p, z_p, T_t_p, T_s_p = demo.sample(n_pool, device=device, dtype=dtype)
+        pool = (x_p, A_p, z_p, T_t_p, T_s_p)
+        print(f"[demo-pool] cached pool: x={tuple(x_p.shape)}, "
+              f"{(x_p.numel()*x_p.element_size())/1e6:.1f} MB")
+
     # --- training ---
     losses_log: list[float] = []
     pbar = tqdm(range(args.steps), desc="ours-V2 pose train")
     for step in pbar:
-        x, branch_A, z_e, T_target, T_start = demo.sample(args.batch, device=device, dtype=dtype)
+        if pool is not None:
+            idx = torch.randint(0, pool[0].shape[0], (args.batch,), device=device)
+            x        = pool[0][idx]
+            branch_A = pool[1][idx]
+            z_e      = pool[2][idx]
+            T_target = pool[3][idx]
+            T_start  = pool[4][idx]
+        else:
+            x, branch_A, z_e, T_target, T_start = demo.sample(args.batch, device=device, dtype=dtype)
         goal_cond = torch.cat([T_start, T_target], dim=-1)                    # (B, 14)
         # warmup
         if step < args.warmup_steps:

@@ -18,7 +18,8 @@ from pathlib import Path
 import torch
 import pybullet_data
 
-from smcdp.manifolds_pose import Franka7DoFPose
+from smcdp.manifolds_pose import Franka7DoFPose, BoundedChartPoseManifold
+from smcdp.charts import make_chart_from_manifold
 from smcdp.franka.self_model_pose import (
     PoseResidualMLP, LearnedSelfModelFranka7DoFPose,
 )
@@ -86,6 +87,14 @@ def main():
     )
     arm._ensure_chain(torch.zeros(1, 7, device=device))
 
+    if a.get("bounded_chart", False):
+        arm = BoundedChartPoseManifold(
+            arm, make_chart_from_manifold(arm, bounded=True),
+            lambda_floor=float(a.get("lambda_floor", 1e-4)),
+        )
+        print(f"[bounded-chart] eval-side wrap enabled "
+              f"(lambda_floor={a.get('lambda_floor', 1e-4):.1e})")
+
     H1 = a["H"] + 1
     n_q, n_T = 7, 7
     CTX_DIM = n_T + n_T + 1                                 # 15
@@ -99,12 +108,17 @@ def main():
         ).to(device)
         scheduler = None
     elif a["baseline"] == "dp_official":
+        # CRITICAL: pass clip_sample from saved scheduler_config (not default).
+        # Default clip_sample=True clips q to [-1,1], which breaks for Franka
+        # joints where q[5] ∈ (-0.087, 3.822) and q[3] ∈ (-3.142, 0).
+        clip_s = ck.get("scheduler_config", {}).get("clip_sample", True)
         if a.get("cond_injection", "global") == "channel":
             model, scheduler = make_official_diffusion_policy(
                 n_q=n_q + CTX_DIM, global_cond_dim=None,
                 down_dims=list(a["down_dims"]),
                 diffusion_step_embed_dim=a["diff_step_embed"],
                 n_train_timesteps=a["dp_train_timesteps"],
+                clip_sample=clip_s,
             )
         else:
             model, scheduler = make_official_diffusion_policy(
@@ -112,14 +126,17 @@ def main():
                 down_dims=list(a["down_dims"]),
                 diffusion_step_embed_dim=a["diff_step_embed"],
                 n_train_timesteps=a["dp_train_timesteps"],
+                clip_sample=clip_s,
             )
         model = model.to(device)
     elif a["baseline"] == "projected":
+        clip_s = ck.get("scheduler_config", {}).get("clip_sample", True)
         model, scheduler = make_official_diffusion_policy(
             n_q=n_q + n_T, global_cond_dim=CTX_DIM,
             down_dims=list(a["down_dims"]),
             diffusion_step_embed_dim=a["diff_step_embed"],
             n_train_timesteps=a["dp_train_timesteps"],
+            clip_sample=clip_s,
         )
         model = model.to(device)
     else:
@@ -145,8 +162,13 @@ def main():
             p_box_lo=tuple(a["p_box_lo"]), p_box_hi=tuple(a["p_box_hi"]),
             z_e_range=(z_val, z_val), branch_p_A=a["branch_p_A"],
             jitter_q=a["jitter_q"], n_ik_steps=a["n_ik_steps"],
+            ik_alpha=a.get("ik_alpha", 0.5),
+            ik_alpha_null=a.get("ik_alpha_null", 0.3),
+            ik_lam=a.get("ik_lam", 0.05),
             R_anchor_axis_angle=tuple(a["R_anchor_aa"]),
             target_perturb_rad=target_perturb_rad,
+            ik_clamp_to_limits=a.get("ik_clamp_to_limits", False),
+            ik_clamp_margin_frac=a.get("ik_clamp_margin_frac", 0.001),
         )
         x_demo, _, _, T_target, T_start = data_z.sample(
             args.n_eval_per_z, device=device, dtype=dtype,
@@ -201,6 +223,7 @@ def main():
         m = compute_pose_metrics(
             arm, x_gen, T_target,
             x_demo=x_demo, sigma_R=a["sigma_R"],
+            q_rest_A=list(a["q_rest_A"]), q_rest_B=list(a["q_rest_B"]),
         )
         m["z_e"] = z_val
         metrics["per_z"].append(m)

@@ -54,6 +54,13 @@ def compute_pose_metrics(
     n_w1_dirs: int = 64,
     sigma_R: float = 0.1,
     quat_tol: float = 0.01,
+    # ---- mode classifier (auto-detect from q_rest_A/B if provided) ----
+    # In Tier 0 demos q_rest_A[0]=+0.6, q_rest_B[0]=-0.6 so q[0] is the natural
+    # mode discriminator; in Tier 2 v5 q_rest_A/B differ in q[3]/q[5] instead,
+    # so a fixed q[0]>0 rule misclassifies.  Pass q_rest_A/B (the trainer's
+    # `--q-rest-A`/`-B` lists) and we auto-pick the joint with largest |A−B|.
+    q_rest_A: Optional[list] = None,
+    q_rest_B: Optional[list] = None,
 ) -> dict:
     """Compute full pose-extended metric set.  See `metric.md` for definitions."""
     device = samples.device
@@ -133,20 +140,45 @@ def compute_pose_metrics(
         is_bounded = False
 
     # ---- 4. Multimodality (in physical q-chart for fair v4↔v4.1 comparison) ----
+    # Auto-pick the mode-discriminating joint from q_rest_A/B.  Falls back to
+    # joint 0 with threshold 0 (legacy Tier 0 behaviour) when q_rests are unavailable.
     h_mid = H1 // 2
-    q1_mid_gen = q_phys[:, h_mid, 0]                                # 1st joint at trajectory midpoint
-    frac_A_gen = (q1_mid_gen > 0).float().mean().item()
+    if q_rest_A is not None and q_rest_B is not None:
+        import numpy as _np
+        A_arr = _np.asarray(q_rest_A, dtype=float)
+        B_arr = _np.asarray(q_rest_B, dtype=float)
+        diff = _np.abs(A_arr - B_arr)
+        mode_joint = int(diff.argmax())
+        mode_thresh = 0.5 * (A_arr[mode_joint] + B_arr[mode_joint])
+        mode_A_above = bool(A_arr[mode_joint] > mode_thresh)
+    else:
+        mode_joint = 0
+        mode_thresh = 0.0
+        mode_A_above = True
+
+    q_mid_gen = q_phys[:, h_mid, mode_joint]                        # mode joint at midpoint
+    if mode_A_above:
+        frac_A_gen = (q_mid_gen > mode_thresh).float().mean().item()
+    else:
+        frac_A_gen = (q_mid_gen < mode_thresh).float().mean().item()
+
     if q_phys_demo is not None:
-        q1_mid_demo = q_phys_demo[:, h_mid, 0]
-        frac_A_demo = (q1_mid_demo > 0).float().mean().item()
+        q_mid_demo = q_phys_demo[:, h_mid, mode_joint]
+        if mode_A_above:
+            frac_A_demo = (q_mid_demo > mode_thresh).float().mean().item()
+        else:
+            frac_A_demo = (q_mid_demo < mode_thresh).float().mean().item()
     else:
         frac_A_demo = 0.5                                          # designed bimodal balance
+
     multimodal = {
         "frac_A_gen": frac_A_gen,
         "frac_A_demo": frac_A_demo,
         "mode_frac_err": abs(frac_A_gen - frac_A_demo),
         "mode_collapse": float(frac_A_gen > 0.9 or frac_A_gen < 0.1),
-        "frac_between": (q1_mid_gen.abs() < 0.05).float().mean().item(),
+        "frac_between": ((q_mid_gen - mode_thresh).abs() < 0.05).float().mean().item(),
+        "mode_joint_idx": mode_joint,
+        "mode_threshold": float(mode_thresh),
     }
 
     # ---- 5. Sliced W_1 in physical joint-trajectory space (v4.1 §13 caveat) ----
