@@ -345,6 +345,8 @@ class Franka7DoFPose(EmbodimentPoseGraphManifold):
         metric: str = "riemannian",
         joint_limit_margin_frac: float = 0.10,
         tikhonov_frac: float = 0.0,
+        link_perturb_dl3: float = 0.0,
+        link_perturb_dl5: float = 0.0,
     ):
         super().__init__(n_q=7, n_z=1, sigma_p=sigma_p, sigma_R=sigma_R,
                           metric=metric, tikhonov_frac=tikhonov_frac)
@@ -353,12 +355,25 @@ class Franka7DoFPose(EmbodimentPoseGraphManifold):
         _pk_log_level = logging.getLogger("pytorch_kinematics").level
         logging.getLogger("pytorch_kinematics").setLevel(logging.ERROR)
         try:
-            with open(urdf_path) as f:
-                urdf_str = f.read()
+            if abs(link_perturb_dl3) > 1e-9 or abs(link_perturb_dl5) > 1e-9:
+                # diagnostic_plan §B: zero-shot link-length OOD eval.  Modify the
+                # URDF in memory before chain construction.  Same n_q / joint
+                # limits, only link 3 / link 5 lengths change.
+                from smcdp.franka.franka_link_perturb import make_link_perturbed_urdf
+                urdf_str = make_link_perturbed_urdf(
+                    urdf_path,
+                    dl_3=float(link_perturb_dl3),
+                    dl_5=float(link_perturb_dl5),
+                )
+            else:
+                with open(urdf_path) as f:
+                    urdf_str = f.read()
             chain = pk.build_serial_chain_from_urdf(urdf_str, end_link)
         finally:
             logging.getLogger("pytorch_kinematics").setLevel(_pk_log_level)
         self.chain = chain
+        self.link_perturb_dl3 = float(link_perturb_dl3)
+        self.link_perturb_dl5 = float(link_perturb_dl5)
         self.urdf_path = str(urdf_path)
         self.end_link = str(end_link)
         self.tool_z_max = float(tool_z_max)

@@ -157,11 +157,15 @@ class LearnedSelfModelFranka7DoFPose(Franka7DoFPose):
         sigma_R: float = 0.1,
         metric: str = "riemannian",
         joint_limit_margin_frac: float = 0.10,
+        link_perturb_dl3: float = 0.0,
+        link_perturb_dl5: float = 0.0,
     ):
         super().__init__(
             urdf_path=urdf_path, end_link=end_link, tool_z_max=tool_z_max,
             sigma_p=sigma_p, sigma_R=sigma_R, metric=metric,
             joint_limit_margin_frac=joint_limit_margin_frac,
+            link_perturb_dl3=link_perturb_dl3,
+            link_perturb_dl5=link_perturb_dl5,
         )
         self.residual_net = residual_net
         for p in self.residual_net.parameters():
